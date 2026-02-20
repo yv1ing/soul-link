@@ -20,7 +20,8 @@ if __name__ == "__main__":
             text_input = input("> ")
             text_output = brain.think(text_input=text_input)
             print(text_output)
+
     except (KeyboardInterrupt, EOFError):
         pass
     finally:
-        brain.shutdown()
+        brain.close()

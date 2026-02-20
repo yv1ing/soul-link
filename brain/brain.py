@@ -20,5 +20,5 @@ class Brain:
         )
         return result.final_output
 
-    def shutdown(self) -> None:
-        self.memory.shutdown()
+    def close(self):
+        self.memory.close()
