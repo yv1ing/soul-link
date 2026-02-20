@@ -9,10 +9,14 @@ class Settings(BaseSettings):
     openai_base_url: str = ""
     openai_api_key: str = ""
 
-    brain_model: str = ""
-    brain_prompt: str
+    soul_model: str = ""
+    soul_prompt: str
 
-    data_path: str = "tdata"
+    reflection_model: str = ""
+    reflection_prompt: str = ""
+    reflection_interval: float = 60    # 内循环触发间隔（秒）
+
+    data_path: str = "soul-data"
 
     memory_max_history: int = 20        # 短期记忆最大保留条数
     memory_search_limit: int = 5        # 单次检索返回的长期记忆上限
@@ -45,8 +49,11 @@ def clear_openviking_logger():
                 _h.setLevel(logging.CRITICAL)
 
 with open("prompts/SOUL.md", "r", encoding="utf-8") as f:
-    brain_prompt = f.read().strip()
+    soul_prompt = f.read().strip()
 
-settings = Settings(brain_prompt=brain_prompt)
+with open("prompts/REFLECT.md", "r", encoding="utf-8") as f:
+    reflection_prompt = f.read().strip()
+
+settings = Settings(soul_prompt=soul_prompt, reflection_prompt=reflection_prompt)
 
 os.makedirs(settings.data_path, exist_ok=True)

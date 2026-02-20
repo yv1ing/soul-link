@@ -151,6 +151,24 @@ class MemoryDecay:
 
         return forgotten
 
+    def get_fading(self, retention_max: float = 0.5, limit: int = 10) -> list[dict]:
+        now = time.time()
+        with self._lock:
+            ph = ",".join("?" * len(_NEVER_FORGET))
+            rows = self._conn.execute(
+                f"SELECT uri, category, importance, access_count, last_accessed FROM memory_meta WHERE category NOT IN ({ph})",
+                tuple(_NEVER_FORGET)
+            ).fetchall()
+
+        fading = []
+        for uri, cat, imp, acc, la in rows:
+            ret = self._retention((now - la) / _DAY_SECONDS, imp, acc)
+            if self._soft <= ret < retention_max:
+                fading.append({"uri": uri, "category": cat, "importance": imp, "retention": ret})
+
+        fading.sort(key=lambda x: x["retention"])
+        return fading[:limit]
+
     def purge(self, uris: list[str]) -> None:
         if not uris:
             return

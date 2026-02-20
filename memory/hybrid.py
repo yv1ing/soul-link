@@ -42,6 +42,36 @@ class HybridMemory(SessionABC):
         finally:
             self.session.close_db()
 
+    def gather_reflection_seed(self) -> str:
+        sections: list[str] = []
+
+        profile = self._load_profile_cached()
+        if profile:
+            sections.append(f"## Current user profile\n{profile}")
+
+        episodes = self.episodic.get_recent()
+        if episodes:
+            lines = [f"- {ep['summary']}" for ep in episodes if ep.get("summary")]
+            if lines:
+                sections.append("## Summary of recent conversations\n" + "\n".join(lines))
+
+        if settings.memory_decay_enabled:
+            fading = self.decay.get_fading()
+            if fading:
+                lines = [f"- [{m['category']} | retention: {m['retention']:.0%}] uri: {m['uri']}" for m in fading]
+                sections.append("## Fading memory\n" + "\n".join(lines))
+
+        return "\n\n".join(sections)
+
+    def absorb_reflection(self, reflection: str) -> None:
+        if not reflection:
+            return
+
+        self.persona.feed("assistant", reflection)
+        self.persona.commit()
+        self._profile_cached = False
+        self.episodic.add(summary=f"[self reflection] {reflection[:200]}", message_count=0)
+
     async def get_items(self, limit: int | None = None) -> list[TResponseInputItem]:
         if self._closed:
             return []
