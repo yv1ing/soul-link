@@ -1,9 +1,12 @@
 import os
+import logger
 import threading
 import openviking as ov
 from openviking.message import TextPart
 from config import settings
 
+
+log = logger.get(__name__)
 
 _CATEGORY_KEYWORDS = ("preferences", "entities", "events", "cases", "patterns", "profile")
 
@@ -27,7 +30,11 @@ class PersonaStore:
 
         self._session = self._viking.session(session_id)
         self._session.load()
-        self._session._messages.clear()
+
+        try:
+            self._session._messages.clear()
+        except Exception as e:
+            log.warning(e)
 
     def feed(self, role: str, content: str) -> None:
         with self._lock:
@@ -40,9 +47,9 @@ class PersonaStore:
             self._message_count = 0
             return result
 
-    def search(self, query: str, limit: int | None = None) -> list[dict]:
+    def search(self, query: str) -> list[dict]:
         with self._lock:
-            result = self._viking.search(query, limit=limit or settings.memory_search_limit)
+            result = self._viking.search(query=query, limit=settings.memory_search_limit)
             return [
                 {
                     "uri": m.uri,

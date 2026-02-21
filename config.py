@@ -1,10 +1,11 @@
 import os
-import logging
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     openviking_config_file: str = ""
+
+    telegram_bot_token: str = ""
 
     openai_base_url: str = ""
     openai_api_key: str = ""
@@ -12,9 +13,9 @@ class Settings(BaseSettings):
     soul_model: str = ""
     soul_prompt: str
 
-    reflection_model: str = ""
-    reflection_prompt: str = ""
-    reflection_interval: float = 60    # 内循环触发间隔（秒）
+    introspection_model: str = ""
+    introspection_prompt: str = ""
+    introspection_interval: float = 60    # 内循环触发间隔（秒）
 
     data_path: str = "soul-data"
 
@@ -31,7 +32,7 @@ class Settings(BaseSettings):
     memory_episodic_limit: int = 5                  # 情景缓冲区保留的最近消息数量
     memory_decay_enabled: bool = True               # 是否启用基于艾宾浩斯模型的记忆衰减机制
     memory_decay_base_stability: float = 30.0       # 基础稳定性（天），半衰期 ≈ base * ln(2)
-    memory_decay_importance_weight: float = 1.5     # 重要成都对稳定性的影响权重
+    memory_decay_importance_weight: float = 1.5     # 重要程度对稳定性的影响权重
     memory_decay_access_weight: float = 1.0         # 访问次数对稳定性的影响权重
     memory_decay_soft_threshold: float = 0.15       # 保持率低于该值时在检索阶段过滤（软遗忘）
     memory_decay_hard_threshold: float = 0.02       # 保持率低于该值时在检索阶段删除（硬遗忘）
@@ -41,19 +42,21 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
     )
 
-def clear_openviking_logger():
-    for _name, _obj in logging.Logger.manager.loggerDict.items():
-        if isinstance(_obj, logging.Logger) and _name.startswith(("openviking", "openviking_cli")):
-            _obj.setLevel(logging.CRITICAL)
-            for _h in _obj.handlers:
-                _h.setLevel(logging.CRITICAL)
 
-with open("prompts/SOUL.md", "r", encoding="utf-8") as f:
-    soul_prompt = f.read().strip()
+def _load_prompt(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Required prompt file not found: {path}")
 
-with open("prompts/REFLECT.md", "r", encoding="utf-8") as f:
-    reflection_prompt = f.read().strip()
 
-settings = Settings(soul_prompt=soul_prompt, reflection_prompt=reflection_prompt)
+def _create_settings() -> Settings:
+    s = Settings(
+        soul_prompt=_load_prompt("prompts/SOUL.md"),
+        introspection_prompt=_load_prompt("prompts/INTROSPECTION.md"),
+    )
+    os.makedirs(s.data_path, exist_ok=True)
+    return s
 
-os.makedirs(settings.data_path, exist_ok=True)
+settings = _create_settings()

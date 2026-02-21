@@ -1,6 +1,10 @@
+import time
+import logger
 import asyncio
+import threading
+from dataclasses import dataclass, field
+from datetime import datetime
 from agents import SessionABC, TResponseInputItem
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from config import settings
 from memory.session import SessionStore
 from memory.persona import PersonaStore
@@ -9,8 +13,59 @@ from memory.decay import MemoryDecay
 from memory.importance import score_importance
 
 
+log = logger.get(__name__)
+
 _LTM_TAG = "[LONG_TERM_MEMORY]"
 _PROFILE_TAG = "[USER_PROFILE]"
+_SELF_INTROSPECTION_TAG = "[SELF_INTROSPECTION]"
+
+
+def _format_ts(ts: float) -> str:
+    return datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
+
+
+@dataclass
+class IntrospectionSeed:
+    profile: str | None = None
+    episodes: list[dict] = field(default_factory=list)
+    fading: list[dict] = field(default_factory=list)
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.episodes and not self.fading
+
+    @property
+    def section_names(self) -> list[str]:
+        names = []
+        if self.profile:
+            names.append("profile")
+        if self.episodes:
+            names.append("episodes")
+        if self.fading:
+            names.append("fading")
+        return names
+
+    def render(self) -> str:
+        sections: list[str] = []
+
+        if self.profile:
+            sections.append(f"## Current user profile\n{self.profile}")
+
+        if self.episodes:
+            lines = [f"- ({ep['time']}) {ep['summary']}" for ep in self.episodes]
+            sections.append("## Summary of recent conversations\n" + "\n".join(lines))
+
+        if self.fading:
+            lines = []
+            for m in self.fading:
+                abstract = m.get("abstract", "")
+                hint = f" {abstract}" if abstract else ""
+                lines.append(
+                    f"- [{m['category']} | retention: {m['retention']:.0%}]{hint} (uri: {m['uri']})"
+                )
+            sections.append("## Fading memory\n" + "\n".join(lines))
+
+        return "\n\n".join(sections)
 
 
 class HybridMemory(SessionABC):
@@ -24,6 +79,9 @@ class HybridMemory(SessionABC):
         self.persona = PersonaStore(session_id=session_id)
 
         self._pending_messages: list[dict] = []
+        self._pending_lock = threading.Lock()
+        self._commit_lock = threading.Lock()
+        self._profile_lock = threading.Lock()
         self._profile_cache: str | None = None
         self._profile_cached = False
 
@@ -32,45 +90,61 @@ class HybridMemory(SessionABC):
             return
         self._closed = True
 
-        try:
-            if self.persona.message_count > 0:
-                self.persona.commit()
+        with self._commit_lock:
+            try:
+                if self.persona.message_count > 0:
+                    self.persona.commit()
 
-            pending = self._flush_pending()
-            if pending:
-                self.episodic.add(summary=pending[0], message_count=pending[1])
-        finally:
-            self.session.close_db()
+                pending = self._flush_pending()
+                if pending:
+                    self.episodic.add(summary=pending[0], message_count=pending[1])
+            finally:
+                self.session.close_db()
 
-    def gather_reflection_seed(self) -> str:
-        sections: list[str] = []
+    def gather_introspection_seed(self) -> IntrospectionSeed:
+        seed = IntrospectionSeed()
 
-        profile = self._load_profile_cached()
-        if profile:
-            sections.append(f"## Current user profile\n{profile}")
+        seed.profile = self._load_profile_cached()
 
         episodes = self.episodic.get_recent()
         if episodes:
-            lines = [f"- {ep['summary']}" for ep in episodes if ep.get("summary")]
-            if lines:
-                sections.append("## Summary of recent conversations\n" + "\n".join(lines))
+            seed.episodes = [
+                {"summary": ep["summary"], "time": _format_ts(ep["created_at"])}
+                for ep in episodes
+                if ep.get("summary") and not ep["summary"].startswith(_SELF_INTROSPECTION_TAG)
+            ]
+
+        if not seed.episodes:
+            pending_summary = self._peek_pending_summary()
+            if pending_summary:
+                seed.episodes = [
+                    {"summary": pending_summary, "time": _format_ts(time.time())}
+                ]
 
         if settings.memory_decay_enabled:
             fading = self.decay.get_fading()
             if fading:
-                lines = [f"- [{m['category']} | retention: {m['retention']:.0%}] uri: {m['uri']}" for m in fading]
-                sections.append("## Fading memory\n" + "\n".join(lines))
+                for m in fading:
+                    try:
+                        overview = self.persona.read_overview(m["uri"])
+                        if overview:
+                            m["abstract"] = overview[:100]
+                    except Exception as e:
+                        log.debug("failed to read overview for fading memory uri=%s, %s", m["uri"], e)
+                seed.fading = fading
 
-        return "\n\n".join(sections)
+        return seed
 
-    def absorb_reflection(self, reflection: str) -> None:
-        if not reflection:
+    def absorb_introspection(self, introspection: str) -> None:
+        if not introspection:
             return
 
-        self.persona.feed("assistant", reflection)
+        self.persona.feed("assistant", introspection)
         self.persona.commit()
-        self._profile_cached = False
-        self.episodic.add(summary=f"[self reflection] {reflection[:200]}", message_count=0)
+        with self._profile_lock:
+            self._profile_cached = False
+
+        self.episodic.add(summary=f"{_SELF_INTROSPECTION_TAG} {introspection[:200]}", message_count=0)
 
     async def get_items(self, limit: int | None = None) -> list[TResponseInputItem]:
         if self._closed:
@@ -94,14 +168,14 @@ class HybridMemory(SessionABC):
             )
 
             if settings.memory_decay_enabled:
-                memories = self.decay.apply_decay(memories)
+                memories = await asyncio.to_thread(self.decay.apply_decay, memories)
 
-            ltm_block = self._build_ltm_block(memories, episodes)
+            ltm_block = await asyncio.to_thread(self._build_ltm_block, memories, episodes)
             if ltm_block:
                 prefix.append({"role": "system", "content": ltm_block})
 
             if memories and settings.memory_decay_enabled:
-                self.decay.record_accesses(memories)
+                await asyncio.to_thread(self.decay.record_accesses, memories)
 
         return prefix + items
 
@@ -114,47 +188,75 @@ class HybridMemory(SessionABC):
         if not filtered:
             return
 
-        self.session.add(filtered)
+        await asyncio.to_thread(self.session.add, filtered)
 
         has_urgent = False
+        pairs: list[tuple[str, str]] = []
         for it in filtered:
             role = str(it.get("role", ""))
             content = str(it.get("content", ""))
             if role in ("user", "assistant") and content:
-                self.persona.feed(role, content)
-                self._pending_messages.append({"role": role, "text": content})
-
+                pairs.append((role, content))
                 if role == "user" and score_importance(role, content) >= settings.memory_urgent_importance:
                     has_urgent = True
 
+        if pairs:
+            await asyncio.to_thread(self._ingest, pairs)
+
         count = self.persona.message_count
         if count >= settings.memory_commit_threshold or (has_urgent and count >= 1):
-            self._safe_commit()
+            asyncio.get_running_loop().run_in_executor(None, self._background_commit)
 
     async def pop_item(self) -> TResponseInputItem | None:
-        return self.session.pop()
+        return await asyncio.to_thread(self.session.pop)
 
     async def clear_session(self) -> None:
-        self.session.clear()
+        await asyncio.to_thread(self.session.clear)
+
+    def _ingest(self, pairs: list[tuple[str, str]]) -> None:
+        for role, content in pairs:
+            self.persona.feed(role, content)
+        with self._pending_lock:
+            self._pending_messages.extend({"role": role, "text": content} for role, content in pairs)
+
+    def _background_commit(self) -> None:
+        if self._closed:
+            return
+        with self._commit_lock:
+            if self._closed:
+                return
+            try:
+                self._safe_commit()
+            except Exception as e:
+                log.warning("background memory commit failed: %s", e, exc_info=True)
 
     def _flush_pending(self) -> tuple[str, int] | None:
-        if not self._pending_messages:
-            return None
-        summary = self._summarize_episode(self._pending_messages)
-        count = len(self._pending_messages)
-        self._pending_messages.clear()
+        with self._pending_lock:
+            if not self._pending_messages:
+                return None
+            messages = list(self._pending_messages)
+            self._pending_messages.clear()
+        summary = self._summarize_episode(messages)
+        return (summary, len(messages)) if summary else None
 
-        return (summary, count) if summary else None
+    def _peek_pending_summary(self) -> str | None:
+        with self._pending_lock:
+            if not self._pending_messages:
+                return None
+            messages = list(self._pending_messages)
+        return self._summarize_episode(messages) or None
 
     def _load_profile_cached(self) -> str | None:
-        if not self._profile_cached:
-            self._profile_cache = self.persona.load_profile()
-            self._profile_cached = True
-        return self._profile_cache
+        with self._profile_lock:
+            if not self._profile_cached:
+                self._profile_cache = self.persona.load_profile()
+                self._profile_cached = True
+            return self._profile_cache
 
     def _safe_commit(self) -> None:
         self.persona.commit()
-        self._profile_cached = False
+        with self._profile_lock:
+            self._profile_cached = False
 
         pending = self._flush_pending()
         if pending:
@@ -168,8 +270,8 @@ class HybridMemory(SessionABC):
                     try:
                         self.persona.delete_memory(item["uri"])
                         deleted.append(item["uri"])
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        log.debug("failed to delete forgotten memory uri=%s, %s", item["uri"], e)
                 if deleted:
                     self.decay.purge(deleted)
 
@@ -200,16 +302,13 @@ class HybridMemory(SessionABC):
                     medium_items.append(f"- [{cat}] {abstract}")
 
         if uris_to_fetch:
-            with ThreadPoolExecutor(max_workers=min(len(uris_to_fetch), 4)) as pool:
-                futures = {pool.submit(self.persona.read_overview, uri): idx for idx, uri in uris_to_fetch}
-                for future in as_completed(futures):
-                    idx = futures[future]
-                    try:
-                        result = future.result()
-                        if isinstance(result, str) and result:
-                            high_candidates[idx] = (high_candidates[idx][0], result)
-                    except Exception:
-                        pass
+            for idx, uri in uris_to_fetch:
+                try:
+                    overview = self.persona.read_overview(uri)
+                    if isinstance(overview, str) and overview:
+                        high_candidates[idx] = (high_candidates[idx][0], overview)
+                except Exception as e:
+                    log.debug("failed to fetch overview for uri=%s, e", uri, e)
 
         high_items = [f"- [{m.get('category', '')}] {text}" for m, text in high_candidates]
 
