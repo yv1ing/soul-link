@@ -124,14 +124,23 @@ class HybridMemory(SessionABC):
         if settings.memory_decay_enabled:
             fading = self.decay.get_fading()
             if fading:
+                alive = []
+                stale_uris = []
                 for m in fading:
                     try:
                         overview = self.persona.read_overview(m["uri"])
-                        if overview:
-                            m["abstract"] = overview[:100]
-                    except Exception as e:
-                        log.debug("failed to read overview for fading memory uri=%s, %s", m["uri"], e)
-                seed.fading = fading
+                    except Exception:
+                        alive.append(m)
+                        continue
+                    if overview is None:
+                        stale_uris.append(m["uri"])
+                        continue
+                    m["abstract"] = overview[:100]
+                    alive.append(m)
+                if stale_uris:
+                    self.decay.purge(stale_uris)
+                    log.info("purged %d stale fading memory entries", len(stale_uris))
+                seed.fading = alive
 
         return seed
 
@@ -265,15 +274,12 @@ class HybridMemory(SessionABC):
         if settings.memory_decay_enabled:
             forgotten = self.decay.collect_forgotten()
             if forgotten:
-                deleted = []
                 for item in forgotten:
                     try:
                         self.persona.delete_memory(item["uri"])
-                        deleted.append(item["uri"])
                     except Exception as e:
                         log.debug("failed to delete forgotten memory uri=%s, %s", item["uri"], e)
-                if deleted:
-                    self.decay.purge(deleted)
+                self.decay.purge([item["uri"] for item in forgotten])
 
     def _build_ltm_block(self, memories: list[dict], episodes: list[dict]) -> str:
         high_th = settings.memory_high_score_threshold
@@ -301,14 +307,13 @@ class HybridMemory(SessionABC):
                 if abstract:
                     medium_items.append(f"- [{cat}] {abstract}")
 
-        if uris_to_fetch:
-            for idx, uri in uris_to_fetch:
-                try:
-                    overview = self.persona.read_overview(uri)
-                    if isinstance(overview, str) and overview:
-                        high_candidates[idx] = (high_candidates[idx][0], overview)
-                except Exception as e:
-                    log.debug("failed to fetch overview for uri=%s, e", uri, e)
+        for idx, uri in uris_to_fetch:
+            try:
+                overview = self.persona.read_overview(uri)
+            except Exception:
+                continue
+            if overview:
+                high_candidates[idx] = (high_candidates[idx][0], overview)
 
         high_items = [f"- [{m.get('category', '')}] {text}" for m, text in high_candidates]
 

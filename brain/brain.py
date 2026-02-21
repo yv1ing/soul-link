@@ -1,9 +1,9 @@
 import time
-import threading
 import logger
+import threading
 from agents import Agent, Runner, function_tool
-from config import settings
 from memory import HybridMemory
+from config import settings, build_introspection_instructions
 
 
 log = logger.get(__name__)
@@ -26,6 +26,8 @@ class Brain:
 
     def close(self):
         self._stopped = True
+        with self._cond:
+            self._cond.notify()
         self.memory.close()
 
     # 反思内循环：
@@ -148,11 +150,17 @@ class Brain:
 
             try:
                 overview = _memory.persona.read_overview(uri)
-                log.info("introspection recall_detail, uri=%s -> %d chars", uri, len(overview))
-                return overview
             except Exception as e:
                 log.warning("introspection recall_detail failed: %s, uri=%s", e, uri, exc_info=True)
                 return "Failed to retrieve overview."
+
+            if overview is None:
+                _memory.decay.purge([uri])
+                log.info("introspection recall_detail: memory gone, purged metadata, uri=%s", uri)
+                return "This memory no longer exists — it has already been forgotten."
+
+            log.info("introspection recall_detail, uri=%s -> %d chars", uri, len(overview))
+            return overview
 
         @function_tool
         def reinforce(uri: str) -> str:
@@ -186,17 +194,18 @@ class Brain:
 
             try:
                 _memory.persona.delete_memory(uri)
-                _memory.decay.purge([uri])
-                log.info("introspection forget, uri=%s", uri)
-                return "The memory has been forgotten."
             except Exception as e:
-                log.warning("introspection forget failed: %s, uri=%s", e, uri, exc_info=True)
+                log.warning("introspection forget delete failed: %s, uri=%s", e, uri, exc_info=True)
                 return "The operation failed."
+
+            _memory.decay.purge([uri])
+            log.info("introspection forget, uri=%s", uri)
+            return "The memory has been forgotten."
 
         self._introspection_agent = Agent(
             name="Introspection Agent",
             model=settings.introspection_model,
-            instructions=settings.introspection_prompt,
+            instructions=build_introspection_instructions,
             tools=[recall, recall_detail, reinforce, forget],
         )
 

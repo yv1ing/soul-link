@@ -1,8 +1,12 @@
+import logger
 from telegram import Update
 from telegram.ext import filters
 from telegram.ext import Application, MessageHandler, CallbackContext
 from brain.brain import Brain
 from config import settings
+
+
+log = logger.get(__name__)
 
 
 class TelegramBot:
@@ -17,7 +21,11 @@ class TelegramBot:
 
     async def handle_text(self, update: Update, context: CallbackContext):
         text_input = update.message.text
-        text_output = await self.brain.think(text_input=text_input)
+        try:
+            text_output = await self.brain.think(text_input=text_input)
+        except Exception as e:
+            log.warning("failed to process message: %s", e)
+            text_output = e
 
         await update.message.reply_text(text=text_output)
 

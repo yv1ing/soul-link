@@ -32,9 +32,9 @@ class PersonaStore:
         self._session.load()
 
         try:
-            self._session._messages.clear()
+            self._session.messages.clear()
         except Exception as e:
-            log.warning(e)
+            log.warning("failed to clear session messages: %s", e)
 
     def feed(self, role: str, content: str) -> None:
         with self._lock:
@@ -69,13 +69,24 @@ class PersonaStore:
             except Exception:
                 return None
 
-    def read_overview(self, uri: str) -> str:
+    def read_overview(self, uri: str) -> str | None:
         with self._lock:
-            return self._viking.read(uri)
+            try:
+                return self._viking.read(uri)
+            except Exception as e:
+                if "no such file" in str(e).lower():
+                    return None
+                raise
 
     def delete_memory(self, uri: str) -> None:
         with self._lock:
-            self._viking.rm(uri)
+            try:
+                self._viking.rm(uri)
+            except Exception as e:
+                if "no such file" in str(e).lower():
+                    log.debug("delete_memory: already gone, uri=%s", uri)
+                    return
+                raise
 
     @property
     def message_count(self) -> int:

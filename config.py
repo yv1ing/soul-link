@@ -11,12 +11,13 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
 
     soul_model: str = ""
-    soul_prompt: str
+    soul_prompt: str = ""
 
     introspection_model: str = ""
     introspection_prompt: str = ""
     introspection_interval: float = 60    # 内循环触发间隔（秒）
 
+    skills_path: str = "skills"
     data_path: str = "soul-data"
 
     memory_max_history: int = 20        # 短期记忆最大保留条数
@@ -51,6 +52,20 @@ def _load_prompt(path: str) -> str:
         raise FileNotFoundError(f"Required prompt file not found: {path}")
 
 
+def _load_skills(skills_dir: str) -> str:
+    if not os.path.isdir(skills_dir):
+        return ""
+    files = sorted(f for f in os.listdir(skills_dir) if f.endswith(".md"))
+    parts = []
+    for f in files:
+        path = os.path.join(skills_dir, f)
+        with open(path, "r", encoding="utf-8") as fh:
+            content = fh.read().strip()
+            if content:
+                parts.append(content)
+    return "\n\n".join(parts)
+
+
 def _create_settings() -> Settings:
     s = Settings(
         soul_prompt=_load_prompt("prompts/SOUL.md"),
@@ -58,5 +73,15 @@ def _create_settings() -> Settings:
     )
     os.makedirs(s.data_path, exist_ok=True)
     return s
+
+
+def build_introspection_instructions(ctx, agent) -> str:
+    base = settings.introspection_prompt
+    skills = _load_skills(settings.skills_path)
+    if skills:
+        return f"{base}\n\n{skills}"
+
+    return base
+
 
 settings = _create_settings()
