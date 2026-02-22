@@ -81,13 +81,12 @@ def _create_settings() -> Settings:
     return s
 
 
-def build_introspection_instructions(ctx, agent) -> str:
-    base = settings.introspection_prompt
+def build_soul_instructions(ctx, agent) -> str:
+    base = settings.soul_prompt
     skills = _load_skills(settings.skills_path)
     if skills:
         return f"{base}\n\n{skills}"
 
     return base
-
 
 settings = _create_settings()

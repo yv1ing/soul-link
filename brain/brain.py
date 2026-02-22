@@ -4,7 +4,7 @@ from agents import Agent, Runner
 from memory import HybridMemory
 from brain.emotion import EmotionTracker
 from brain.introspection import IntrospectionLoop
-from config import settings
+from config import settings, build_soul_instructions
 
 
 log = logger.get(__name__)
@@ -67,7 +67,7 @@ class Brain:
         self._soul_agent = Agent(
             name="Soul Agent",
             model=settings.soul_model,
-            instructions=settings.soul_prompt,
+            instructions=build_soul_instructions,
         )
 
         return self._soul_agent

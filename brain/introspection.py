@@ -4,7 +4,7 @@ import logger
 from pydantic import BaseModel, Field
 from agents import Agent, Runner, function_tool
 from memory import HybridMemory
-from config import settings, build_introspection_instructions
+from config import settings
 
 
 log = logger.get(__name__)
@@ -210,7 +210,7 @@ class IntrospectionLoop:
         self._agent = Agent(
             name="Introspection Agent",
             model=settings.introspection_model,
-            instructions=build_introspection_instructions,
+            instructions=settings.introspection_prompt,
             tools=[recall, recall_detail, reinforce, forget],
             output_type=IntrospectionOutput,
         )
