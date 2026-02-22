@@ -17,6 +17,8 @@ log = logger.get(__name__)
 
 _LTM_TAG = "[LONG_TERM_MEMORY]"
 _PROFILE_TAG = "[USER_PROFILE]"
+_EMOTIONAL_TAG = "[EMOTIONAL_CONTEXT]"
+_CALIBRATION_TAG = "[CALIBRATION]"
 _SELF_INTROSPECTION_TAG = "[SELF_INTROSPECTION]"
 
 
@@ -27,6 +29,7 @@ def _format_ts(ts: float) -> str:
 @dataclass
 class IntrospectionSeed:
     profile: str | None = None
+    emotional_state: str | None = None
     episodes: list[dict] = field(default_factory=list)
     fading: list[dict] = field(default_factory=list)
 
@@ -39,6 +42,8 @@ class IntrospectionSeed:
         names = []
         if self.profile:
             names.append("profile")
+        if self.emotional_state:
+            names.append("emotional_state")
         if self.episodes:
             names.append("episodes")
         if self.fading:
@@ -50,6 +55,9 @@ class IntrospectionSeed:
 
         if self.profile:
             sections.append(f"## Current user profile\n{self.profile}")
+
+        if self.emotional_state:
+            sections.append(f"## Emotional state\n{self.emotional_state}")
 
         if self.episodes:
             lines = [f"- ({ep['time']}) {ep['summary']}" for ep in self.episodes]
@@ -84,6 +92,18 @@ class HybridMemory(SessionABC):
         self._profile_lock = threading.Lock()
         self._profile_cache: str | None = None
         self._profile_cached = False
+        self._emotional_state: str | None = None
+        self._calibrations: list[str] = []
+
+    def get_emotion_context(self, limit: int = 6) -> str:
+        items = self.session.get(limit)
+        parts = []
+        for it in items:
+            role = it.get("role", "")
+            content = str(it.get("content", ""))
+            if role in ("user", "assistant") and content:
+                parts.append(f"[{role}]: {content[:200]}")
+        return "\n".join(parts)
 
     def close(self) -> None:
         if self._closed:
@@ -101,10 +121,17 @@ class HybridMemory(SessionABC):
             finally:
                 self.session.close_db()
 
+    def set_emotional_state(self, tracker) -> None:
+        self._emotional_state = tracker.render()
+
+    def set_calibrations(self, calibrations: list[str]) -> None:
+        self._calibrations = list(calibrations)
+
     def gather_introspection_seed(self) -> IntrospectionSeed:
         seed = IntrospectionSeed()
 
         seed.profile = self._load_profile_cached()
+        seed.emotional_state = self._emotional_state
 
         episodes = self.episodic.get_recent()
         if episodes:
@@ -169,6 +196,13 @@ class HybridMemory(SessionABC):
         if profile:
             prefix.append({"role": "system", "content": f"{_PROFILE_TAG}\nThe following is user profile information:\n{profile}"})
 
+        if self._emotional_state:
+            prefix.append({"role": "system", "content": f"{_EMOTIONAL_TAG}\n{self._emotional_state}"})
+
+        if self._calibrations:
+            lines = "\n".join(f"- {c}" for c in self._calibrations)
+            prefix.append({"role": "system", "content": f"{_CALIBRATION_TAG}\n近期自我反思中的注意事项：\n{lines}"})
+
         query = self._build_query(items)
         if query:
             memories, episodes = await asyncio.gather(
@@ -193,7 +227,7 @@ class HybridMemory(SessionABC):
             return
 
         filtered = [it for it in items
-                    if not str(it.get("content", "")).startswith((_LTM_TAG, _PROFILE_TAG))]
+                    if not str(it.get("content", "")).startswith((_LTM_TAG, _PROFILE_TAG, _EMOTIONAL_TAG, _CALIBRATION_TAG))]
         if not filtered:
             return
 

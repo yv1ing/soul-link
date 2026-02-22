@@ -13,9 +13,14 @@ class Settings(BaseSettings):
     soul_model: str = ""
     soul_prompt: str = ""
 
+    emotion_model: str = ""
+    emotion_prompt: str = ""
+
     introspection_model: str = ""
     introspection_prompt: str = ""
     introspection_interval: float = 60    # 内循环触发间隔（秒）
+
+    emotion_context_turns: int = 6        # 情绪分析时注入的最近对话条数
 
     skills_path: str = "skills"
     data_path: str = "soul-data"
@@ -69,6 +74,7 @@ def _load_skills(skills_dir: str) -> str:
 def _create_settings() -> Settings:
     s = Settings(
         soul_prompt=_load_prompt("prompts/SOUL.md"),
+        emotion_prompt=_load_prompt("prompts/EMOTION.md"),
         introspection_prompt=_load_prompt("prompts/INTROSPECTION.md"),
     )
     os.makedirs(s.data_path, exist_ok=True)
