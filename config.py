@@ -73,9 +73,9 @@ def _load_skills(skills_dir: str) -> str:
 
 def _create_settings() -> Settings:
     s = Settings(
-        soul_prompt=_load_prompt("prompts/SOUL.md"),
-        emotion_prompt=_load_prompt("prompts/EMOTION.md"),
-        introspection_prompt=_load_prompt("prompts/INTROSPECTION.md"),
+        soul_prompt=_load_prompt("prompts/庄颜/SOUL.md"),
+        emotion_prompt=_load_prompt("prompts/庄颜/EMOTION.md"),
+        introspection_prompt=_load_prompt("prompts/庄颜/INTROSPECTION.md"),
     )
     os.makedirs(s.data_path, exist_ok=True)
     return s
