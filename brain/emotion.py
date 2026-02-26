@@ -11,15 +11,17 @@ log = logger.get(__name__)
 
 @dataclass
 class EmotionalState:
-    valence: float = 0.0    # -1 ~ +1（负面 ~ 正面）
-    arousal: float = 0.0    # 0 ~ 1（平静 ~ 激动）
-    trend: str = "stable"   # rising / stable / falling
-    description: str = ""   # LLM 生成的自然语言描述
+    valence: float = 0.0      # -1 ~ +1（负面 ~ 正面）
+    arousal: float = 0.0      # 0 ~ 1（平静 ~ 激动）
+    dominance: float = 0.5    # 0 ~ 1（被动/脆弱 ~ 自信/掌控）
+    trend: str = "stable"     # rising / stable / falling
+    description: str = ""     # LLM 生成的自然语言描述
 
 
 class EmotionAnalysis(BaseModel):
     valence: float = Field(description="Emotional valence, from -1 (extremely negative) to +1 (extremely positive).")
     arousal: float = Field(description="Emotional arousal level, from 0 (calm) to 1 (excited).")
+    dominance: float = Field(description="Dominance level, from 0 (passive, vulnerable, helpless) to 1 (confident, in control, assertive).")
     description: str = Field(description="A one-sentence natural language description of the current emotional state.")
 
 
@@ -28,6 +30,7 @@ class EmotionTracker:
     _DECAY = 0.85
     _CLAMP_V = (-1.0, 1.0)
     _CLAMP_A = (0.0, 1.0)
+    _CLAMP_D = (0.0, 1.0)
 
     def __init__(self):
         self._state = EmotionalState()
@@ -40,23 +43,27 @@ class EmotionTracker:
         if analysis is not None:
             valence = analysis.valence
             arousal = analysis.arousal
+            dominance = analysis.dominance
             description = analysis.description
         else:
             self._state.valence *= self._DECAY
             self._state.arousal *= self._DECAY
+            self._state.dominance = 0.5 + (self._state.dominance - 0.5) * self._DECAY
             self._state.description = ""
             self._update_trend()
             return
 
         self._state.valence = self._state.valence * 0.4 + valence * 0.6
         self._state.arousal = self._state.arousal * 0.4 + arousal * 0.6
+        self._state.dominance = self._state.dominance * 0.4 + dominance * 0.6
         self._state.description = description
 
         self._state.valence = max(self._CLAMP_V[0], min(self._CLAMP_V[1], self._state.valence))
         self._state.arousal = max(self._CLAMP_A[0], min(self._CLAMP_A[1], self._state.arousal))
+        self._state.dominance = max(self._CLAMP_D[0], min(self._CLAMP_D[1], self._state.dominance))
 
         self._update_trend()
-        log.info("emotion update: v=%.2f a=%.2f trend=%s desc=%s",self._state.valence, self._state.arousal, self._state.trend, description[:50] if description else "(fallback)")
+        log.info("emotion update: v=%.2f a=%.2f d=%.2f trend=%s desc=%s", self._state.valence, self._state.arousal, self._state.dominance, self._state.trend, description[:50] if description else "(fallback)")
 
     async def _analyze(self, text: str, context: str = "", emotional_state: str = "") -> EmotionAnalysis | None:
         parts = []
@@ -114,5 +121,5 @@ class EmotionTracker:
     def render(self) -> str:
         s = self._state
         desc = f" ({s.description})" if s.description else ""
-        return f"valence={s.valence:+.2f} arousal={s.arousal:.2f} trend={s.trend}{desc}"
+        return f"valence={s.valence:+.2f} arousal={s.arousal:.2f} dominance={s.dominance:.2f} trend={s.trend}{desc}"
 
