@@ -1,4 +1,3 @@
-import os
 import logger
 import asyncio
 import threading
@@ -26,7 +25,7 @@ class PersonaStore:
         self._lock = threading.Lock()
         self._message_count = 0
 
-        self._viking = ov.SyncOpenViking(path=os.path.join(settings.data_path, "openviking"))
+        self._viking = ov.SyncOpenViking()
         self._viking.initialize()
 
         self._session = self._viking.session(session_id)

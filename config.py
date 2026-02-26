@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     emotion_context_turns: int = 6        # 情绪分析时注入的最近对话条数
 
     skills_path: str = "skills"
-    data_path: str = "data"
+    data_path: str = "soul-data"
 
     memory_max_history: int = 20        # 短期记忆最大保留条数
     memory_search_limit: int = 5        # 单次检索返回的长期记忆上限
