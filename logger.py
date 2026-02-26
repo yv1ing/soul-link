@@ -29,6 +29,9 @@ def init(level: int = logging.INFO) -> None:
     root.setLevel(level)
     root.addHandler(handler)
 
+    for name in ("LiteLLM", "litellm", "httpx", "httpcore", "openai"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
     for entry in logging.Logger.manager.loggerDict.values():
         if isinstance(entry, logging.Logger) and not entry.propagate:
             if entry.name.split(".", 1)[0] not in _PROJECT:

@@ -138,7 +138,7 @@ class IntrospectionLoop:
             output = "\n".join(f"\t- <{m.get('category') or 'uncategorized'} | score: {m['score']:.2f}> {m.get('abstract', '')} (uri: {m.get('uri', '')})" for m in results)
 
             log.info("introspection recall, query=%r -> %d hits", query, len(results))
-            log.debug("recall results:\n%s", output)
+            log.info("recall results:\n%s", output)
             return output
 
         @function_tool

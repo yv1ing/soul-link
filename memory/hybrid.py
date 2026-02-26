@@ -237,7 +237,14 @@ class HybridMemory(SessionABC):
         pairs: list[tuple[str, str]] = []
         for it in filtered:
             role = str(it.get("role", ""))
-            content = str(it.get("content", ""))
+            raw = it.get("content", "")
+            if isinstance(raw, list):
+                content = " ".join(
+                    p.get("text", "") for p in raw
+                    if isinstance(p, dict) and p.get("type") == "output_text"
+                )
+            else:
+                content = str(raw)
             if role in ("user", "assistant") and content:
                 pairs.append((role, content))
                 if role == "user" and score_importance(role, content) >= settings.memory_urgent_importance:

@@ -1,5 +1,6 @@
 import os
 import logger
+import asyncio
 import threading
 import openviking as ov
 from openviking.message import TextPart
@@ -29,7 +30,7 @@ class PersonaStore:
         self._viking.initialize()
 
         self._session = self._viking.session(session_id)
-        self._session.load()
+        asyncio.run(self._session.load())
 
         try:
             self._session.messages.clear()
