@@ -54,7 +54,7 @@ class EpisodicBuffer:
             self._conn.commit()
 
     def get_recent(self, limit: int | None = None) -> list[dict]:
-        limit = limit or self._max_episodes
+        limit = limit if limit is not None else self._max_episodes
         with self._lock:
             rows = self._conn.execute(
                 """

@@ -27,6 +27,6 @@ if __name__ == "__main__":
     try:
         bot.run()
     except Exception as e:
-        log.exception("bot stopped unexpectedly: %s", e)
+        log.exception("bot stopped unexpectedly")
     finally:
         brain.close()

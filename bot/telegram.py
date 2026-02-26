@@ -24,8 +24,8 @@ class TelegramBot:
         try:
             text_output = await self.brain.think(text_input=text_input)
         except Exception as e:
-            log.warning("failed to process message: %s", e)
-            text_output = e
+            log.exception("failed to process message")
+            text_output = str(e)
 
         await update.message.reply_text(text=text_output)
 

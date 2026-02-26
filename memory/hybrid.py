@@ -26,6 +26,20 @@ def _format_ts(ts: float) -> str:
     return datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
 
 
+def _is_injected_system_msg(content) -> bool:
+    """Return True if the content was injected by HybridMemory (not a real conversation turn)."""
+    _TAGS = (_LTM_TAG, _PROFILE_TAG, _EMOTIONAL_TAG, _CALIBRATION_TAG)
+    if isinstance(content, str):
+        return content.startswith(_TAGS)
+    if isinstance(content, list):
+        first_text = next(
+            (p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") in ("text", "output_text")),
+            "",
+        )
+        return first_text.startswith(_TAGS)
+    return False
+
+
 @dataclass
 class IntrospectionSeed:
     profile: str | None = None
@@ -100,7 +114,14 @@ class HybridMemory(SessionABC):
         parts = []
         for it in items:
             role = it.get("role", "")
-            content = str(it.get("content", ""))
+            raw = it.get("content", "")
+            if isinstance(raw, list):
+                content = " ".join(
+                    p.get("text", "") for p in raw
+                    if isinstance(p, dict) and p.get("type") in ("text", "output_text")
+                ).strip()
+            else:
+                content = str(raw) if raw else ""
             if role in ("user", "assistant") and content:
                 parts.append(f"[{role}]: {content[:200]}")
         return "\n".join(parts)
@@ -227,7 +248,7 @@ class HybridMemory(SessionABC):
             return
 
         filtered = [it for it in items
-                    if not str(it.get("content", "")).startswith((_LTM_TAG, _PROFILE_TAG, _EMOTIONAL_TAG, _CALIBRATION_TAG))]
+                    if not _is_injected_system_msg(it.get("content", ""))]
         if not filtered:
             return
 
@@ -241,7 +262,7 @@ class HybridMemory(SessionABC):
             if isinstance(raw, list):
                 content = " ".join(
                     p.get("text", "") for p in raw
-                    if isinstance(p, dict) and p.get("type") == "output_text"
+                    if isinstance(p, dict) and p.get("type") in ("text", "output_text")
                 )
             else:
                 content = str(raw)
@@ -319,7 +340,7 @@ class HybridMemory(SessionABC):
                     try:
                         self.persona.delete_memory(item["uri"])
                     except Exception as e:
-                        log.debug("failed to delete forgotten memory uri=%s, %s", item["uri"], e)
+                        log.warning("failed to delete forgotten memory uri=%s: %s", item["uri"], e)
                 self.decay.purge([item["uri"] for item in forgotten])
 
     def _build_ltm_block(self, memories: list[dict], episodes: list[dict]) -> str:
@@ -379,8 +400,17 @@ class HybridMemory(SessionABC):
         last_assistant: str | None = None
 
         for it in reversed(items):
-            content = it.get("content", "")
-            if not isinstance(content, str) or not content:
+            raw = it.get("content", "")
+            if isinstance(raw, list):
+                content = " ".join(
+                    p.get("text", "") for p in raw
+                    if isinstance(p, dict) and p.get("type") in ("text", "output_text")
+                ).strip()
+            elif isinstance(raw, str):
+                content = raw
+            else:
+                content = ""
+            if not content:
                 continue
             role = it.get("role")
             if role == "user" and len(user_msgs) < 3:

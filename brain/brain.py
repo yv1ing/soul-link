@@ -44,13 +44,12 @@ class Brain:
         self.memory.set_emotional_state(self._emotion)
         self.memory.set_calibrations(self._introspection.calibrations)
 
-        # 后台启动情绪分析（注入对话上下文 + 当前情绪快照）
+        # 后台启动情绪分析（注入对话上下文，当前情绪快照由 tracker 内部自动注入）
         emotion_context = await asyncio.to_thread(
             self.memory.get_emotion_context, settings.emotion_context_turns
         )
-        emotion_snapshot = self._emotion.render()
         self._emotion_task = asyncio.create_task(
-            self._emotion.update(text_input, context=emotion_context, emotional_state=emotion_snapshot)
+            self._emotion.update(text_input, context=emotion_context)
         )
 
         result = await Runner.run(
