@@ -12,7 +12,13 @@ log = logger.get(__name__)
 class TelegramBot:
     def __init__(self, brain: Brain):
         self.brain = brain
-        self.app = Application.builder().token(settings.telegram_bot_token).build()
+        self.app = (
+            Application.builder()
+            .token(settings.telegram_bot_token)
+            .post_init(self._on_start)
+            .post_shutdown(self._on_stop)
+            .build()
+        )
 
         self._register_handlers()
 
@@ -24,10 +30,16 @@ class TelegramBot:
         try:
             text_output = await self.brain.think(text_input=text_input)
         except Exception as e:
-            log.exception("failed to process message")
-            text_output = str(e)
+            log.exception("failed to process message: ", e)
+            return
 
         await update.message.reply_text(text=text_output)
+
+    async def _on_start(self, app):
+        await self.brain.start()
+
+    async def _on_stop(self, app):
+        await self.brain.close()
 
     def _register_handlers(self):
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text))

@@ -40,8 +40,8 @@ class IntrospectionLoop:
         t.start()
 
     def stop(self):
-        self._stopped = True
         with self._cond:
+            self._stopped = True
             self._cond.notify()
 
     def notify_activity(self):
@@ -65,7 +65,7 @@ class IntrospectionLoop:
         while not self._stopped:
             base = self._interval
             ticks = errors if errors > 0 else idle_ticks
-            wait = base * (1 << ticks) if ticks > 0 else base
+            wait = base * (1 << ticks)
 
             # 退避等待：新消息或 stop() 均可唤醒
             with self._cond:

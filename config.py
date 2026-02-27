@@ -1,5 +1,15 @@
+import json
 import os
+from pydantic import BaseModel
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class MCPServerConfig(BaseModel):
+    name: str
+    command: str
+    args: list[str] = []
+    env: dict[str, str] | None = None
+    require_approval: bool = False
 
 
 class Settings(BaseSettings):
@@ -24,6 +34,8 @@ class Settings(BaseSettings):
 
     skills_path: str = "skills"
     data_path: str = "soul-data"
+
+    mcp_servers: list[MCPServerConfig] = []
 
     memory_max_history: int = 20        # 短期记忆最大保留条数
     memory_search_limit: int = 5        # 单次检索返回的长期记忆上限
@@ -57,36 +69,37 @@ def _load_prompt(path: str) -> str:
         raise FileNotFoundError(f"Required prompt file not found: {path}")
 
 
-def _load_skills(skills_dir: str) -> str:
-    if not os.path.isdir(skills_dir):
-        return ""
-    files = sorted(f for f in os.listdir(skills_dir) if f.endswith(".md"))
-    parts = []
-    for f in files:
-        path = os.path.join(skills_dir, f)
-        with open(path, "r", encoding="utf-8") as fh:
-            content = fh.read().strip()
-            if content:
-                parts.append(content)
-    return "\n\n".join(parts)
+def _load_soul_config() -> dict:
+    try:
+        with open(".soul.json", "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+def _parse_mcp_servers(soul_config: dict) -> list[MCPServerConfig]:
+    servers = []
+    for name, cfg in soul_config.get("mcp_servers", {}).items():
+        servers.append(MCPServerConfig(
+            name=name,
+            command=cfg["command"],
+            args=cfg.get("args", []),
+            env=cfg.get("env"),
+            require_approval=cfg.get("require_approval", False),
+        ))
+    return servers
 
 
 def _create_settings() -> Settings:
+    soul_config = _load_soul_config()
     s = Settings(
         soul_prompt=_load_prompt("prompts/庄颜/SOUL.md"),
         emotion_prompt=_load_prompt("prompts/庄颜/EMOTION.md"),
         introspection_prompt=_load_prompt("prompts/庄颜/INTROSPECTION.md"),
+        mcp_servers=_parse_mcp_servers(soul_config),
     )
     os.makedirs(s.data_path, exist_ok=True)
     return s
 
-
-def build_soul_instructions(ctx, agent) -> str:
-    base = settings.soul_prompt
-    skills = _load_skills(settings.skills_path)
-    if skills:
-        return f"{base}\n\n{skills}"
-
-    return base
 
 settings = _create_settings()

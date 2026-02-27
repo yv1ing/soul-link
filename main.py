@@ -23,10 +23,4 @@ if __name__ == "__main__":
     brain.introspect()
 
     bot = TelegramBot(brain=brain)
-
-    try:
-        bot.run()
-    except Exception as e:
-        log.exception("bot stopped unexpectedly")
-    finally:
-        brain.close()
+    bot.run()
