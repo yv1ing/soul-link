@@ -48,35 +48,32 @@ class PersonaStore:
             return result
 
     def search(self, query: str) -> list[dict]:
-        with self._lock:
-            result = self._viking.search(query=query, limit=settings.memory_search_limit)
-            return [
-                {
-                    "uri": m.uri,
-                    "score": m.score,
-                    "abstract": m.abstract,
-                    "overview": m.overview,
-                    "category": m.category or _category_from_uri(m.uri),
-                }
-                for m in result.memories
-            ]
+        result = self._viking.search(query=query, limit=settings.memory_search_limit)
+        return [
+            {
+                "uri": m.uri,
+                "score": m.score,
+                "abstract": m.abstract,
+                "overview": m.overview,
+                "category": m.category or _category_from_uri(m.uri),
+            }
+            for m in result.memories
+        ]
 
     def load_profile(self) -> str | None:
-        with self._lock:
-            try:
-                content = self._viking.read("viking://user/memories/profile.md")
-                return content if content and content.strip() else None
-            except Exception:
-                return None
+        try:
+            content = self._viking.read("viking://user/memories/profile.md")
+            return content if content and content.strip() else None
+        except Exception:
+            return None
 
     def read_overview(self, uri: str) -> str | None:
-        with self._lock:
-            try:
-                return self._viking.read(uri)
-            except Exception as e:
-                if "no such file" in str(e).lower():
-                    return None
-                raise
+        try:
+            return self._viking.read(uri)
+        except Exception as e:
+            if "no such file" in str(e).lower():
+                return None
+            raise
 
     def delete_memory(self, uri: str) -> None:
         with self._lock:

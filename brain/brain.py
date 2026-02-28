@@ -47,11 +47,12 @@ class Brain:
             await self.mcp_manager.cleanup_all()
         except Exception as e:
             log.warning("mcp manager cleanup error: %s", e)
+        await asyncio.to_thread(self._introspection.join)
         self.memory.close()
 
     async def think(self, text_input: str):
         self._introspection.notify_activity()
-        refresh_skill_catalog(settings.skills_path)
+        await asyncio.to_thread(refresh_skill_catalog, settings.skills_path)
 
         # 等待上一轮情绪分析完成
         if self._emotion_task is not None:

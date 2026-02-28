@@ -25,35 +25,32 @@ class IntrospectionLoop:
         self._agent: Agent | None = None
         self._interval: float = settings.introspection_interval
         self._last_activity: float = 0.0
-        self._cond = threading.Condition()
-        self._activity_flag = False
+        self._wake = threading.Event()
         self._stopped = False
-        self._started = False
+        self._thread: threading.Thread | None = None
         self._calibration_buffer: list[str] = []
-        self._calibration_lock = threading.Lock()
 
     def start(self):
-        if self._started:
+        if self._thread is not None:
             return
-        self._started = True
-        t = threading.Thread(target=self._loop, daemon=True)
-        t.start()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
 
     def stop(self):
-        with self._cond:
-            self._stopped = True
-            self._cond.notify()
+        self._stopped = True
+        self._wake.set()
+
+    def join(self, timeout: float = 10.0):
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
 
     def notify_activity(self):
         self._last_activity = time.time()
-        with self._cond:
-            self._activity_flag = True
-            self._cond.notify()
+        self._wake.set()
 
     @property
     def calibrations(self) -> list[str]:
-        with self._calibration_lock:
-            return list(self._calibration_buffer)
+        return list(self._calibration_buffer)
 
     # 反思内循环：
     #   等待（可被用户活动打断）→ 评估活跃状态 → 收集种子 → 执行反思 → 吸收结果
@@ -68,9 +65,8 @@ class IntrospectionLoop:
             wait = base * (1 << ticks)
 
             # 退避等待：新消息或 stop() 均可唤醒
-            with self._cond:
-                self._activity_flag = False
-                self._cond.wait_for(lambda: self._activity_flag or self._stopped, timeout=wait)
+            self._wake.clear()
+            self._wake.wait(timeout=wait)
 
             if self._stopped:
                 break
@@ -98,8 +94,7 @@ class IntrospectionLoop:
 
                 # 反思结果写入长期记忆
                 output = result.final_output  # IntrospectionOutput
-                with self._calibration_lock:
-                    self._calibration_buffer = output.calibrations[-5:]
+                self._calibration_buffer = output.calibrations[-5:]
 
                 self._memory.absorb_introspection(output.insights)
                 log.info("introspection done, insights=%s, calibrations=%d",
