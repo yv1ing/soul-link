@@ -1,5 +1,7 @@
+import asyncio
 import logger
 from telegram import Update
+from telegram.constants import ChatAction
 from telegram.ext import filters
 from telegram.ext import Application, MessageHandler, CallbackContext
 from brain.brain import Brain
@@ -27,11 +29,21 @@ class TelegramBot:
 
     async def handle_text(self, update: Update, context: CallbackContext):
         text_input = update.message.text
+        chat_id = update.effective_chat.id
+
+        async def keep_typing():
+            while True:
+                await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+                await asyncio.sleep(4)
+
+        typing_task = asyncio.create_task(keep_typing())
         try:
             text_output = await self.brain.think(text_input=text_input)
         except Exception as e:
             log.exception("failed to process message: ", e)
             return
+        finally:
+            typing_task.cancel()
 
         await update.message.reply_text(text=text_output)
 
