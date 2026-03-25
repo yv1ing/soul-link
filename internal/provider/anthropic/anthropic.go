@@ -18,10 +18,11 @@ type Provider struct {
 	client    sdk.Client
 	model     string
 	maxTokens int64
+	thinking  *model.ThinkingConfig
 }
 
-// New 创建 Anthropic Provider。maxTokens <= 0 时使用默认值；baseURL 为空时使用 SDK 默认地址。
-func New(apiKey, baseURL, modelName string, maxTokens int64, opts ...option.RequestOption) *Provider {
+// New 创建 Anthropic Provider
+func New(apiKey, baseURL, modelName string, maxTokens int64, thinking *model.ThinkingConfig, opts ...option.RequestOption) *Provider {
 	base := []option.RequestOption{option.WithAPIKey(apiKey)}
 	if baseURL != "" {
 		base = append(base, option.WithBaseURL(baseURL))
@@ -31,14 +32,16 @@ func New(apiKey, baseURL, modelName string, maxTokens int64, opts ...option.Requ
 		client:    sdk.NewClient(append(base, opts...)...),
 		model:     modelName,
 		maxTokens: defaultMaxTokens,
+		thinking:  thinking,
 	}
+
 	if maxTokens > 0 {
 		p.maxTokens = maxTokens
 	}
 	return p
 }
 
-// Stream 发起流式请求，通过 channel 逐步投递事件，ctx 取消时 goroutine 安全退出
+// Stream 发起流式请求，通过 channel 逐步投递事件
 func (p *Provider) Stream(ctx context.Context, messages []model.Message, tools []model.ToolSet) (<-chan provider.Event, error) {
 	stream := p.client.Messages.NewStreaming(ctx, p.buildRequest(messages, tools))
 
@@ -56,10 +59,14 @@ func (p *Provider) Stream(ctx context.Context, messages []model.Message, tools [
 		}
 
 		var (
-			toolBuf         strings.Builder
-			currentToolID   string
-			currentToolName string
-			inputTokens     int
+			toolBuf          strings.Builder
+			thinkingBuf      strings.Builder
+			signatureBuf     strings.Builder
+			currentToolID    string
+			currentToolName  string
+			currentBlockType string
+			redactedData     string
+			inputTokens      int
 		)
 
 		for stream.Next() {
@@ -71,10 +78,17 @@ func (p *Provider) Stream(ctx context.Context, messages []model.Message, tools [
 
 			case "content_block_start":
 				cb := event.AsContentBlockStart().ContentBlock
-				if cb.Type == "tool_use" {
+				currentBlockType = cb.Type
+				switch cb.Type {
+				case "tool_use":
 					currentToolID = cb.ID
 					currentToolName = cb.Name
 					toolBuf.Reset()
+				case "thinking":
+					thinkingBuf.Reset()
+					signatureBuf.Reset()
+				case "redacted_thinking":
+					redactedData = cb.Data
 				}
 
 			case "content_block_delta":
@@ -86,22 +100,41 @@ func (p *Provider) Stream(ctx context.Context, messages []model.Message, tools [
 					}
 				case "input_json_delta":
 					toolBuf.WriteString(delta.AsInputJSONDelta().PartialJSON)
+				case "thinking_delta":
+					text := delta.AsThinkingDelta().Thinking
+					thinkingBuf.WriteString(text)
+					if !send(provider.Event{Type: provider.EventTypeThinkingDelta, Text: text}) {
+						return
+					}
+				case "signature_delta":
+					signatureBuf.WriteString(delta.AsSignatureDelta().Signature)
 				}
 
 			case "content_block_stop":
-				if currentToolID == "" {
-					continue
+				switch currentBlockType {
+				case "tool_use":
+					tc, err := provider.ParseToolCall(currentToolID, currentToolName, toolBuf.String())
+					currentToolID, currentToolName = "", ""
+					toolBuf.Reset()
+					if err != nil {
+						send(provider.Event{Type: provider.EventTypeError, Err: err})
+						return
+					}
+					if !send(provider.Event{Type: provider.EventTypeToolCall, ToolCall: tc}) {
+						return
+					}
+				case "thinking":
+					td := &model.ThinkingData{Text: thinkingBuf.String(), Signature: signatureBuf.String()}
+					if !send(provider.Event{Type: provider.EventTypeThinkingDone, Thinking: td}) {
+						return
+					}
+				case "redacted_thinking":
+					td := &model.ThinkingData{Redacted: true, Data: redactedData}
+					if !send(provider.Event{Type: provider.EventTypeThinkingDone, Thinking: td}) {
+						return
+					}
 				}
-				tc, err := provider.ParseToolCall(currentToolID, currentToolName, toolBuf.String())
-				currentToolID, currentToolName = "", ""
-				toolBuf.Reset()
-				if err != nil {
-					send(provider.Event{Type: provider.EventTypeError, Err: err})
-					return
-				}
-				if !send(provider.Event{Type: provider.EventTypeToolCall, ToolCall: tc}) {
-					return
-				}
+				currentBlockType = ""
 
 			case "message_delta":
 				u := event.AsMessageDelta().Usage
@@ -111,7 +144,6 @@ func (p *Provider) Stream(ctx context.Context, messages []model.Message, tools [
 				}) {
 					return
 				}
-				return
 			}
 		}
 
@@ -152,6 +184,10 @@ func (p *Provider) buildRequest(messages []model.Message, tools []model.ToolSet)
 	if system != "" {
 		req.System = []sdk.TextBlockParam{{Text: system}}
 	}
+	if p.thinking != nil && p.thinking.BudgetTokens > 0 {
+		req.Thinking = sdk.ThinkingConfigParamOfEnabled(p.thinking.BudgetTokens)
+	}
+
 	return req
 }
 
@@ -162,25 +198,19 @@ func convertMessages(messages []model.Message) (params []sdk.MessageParam, syste
 
 		case model.MessageRoleSystem:
 			for _, c := range msg.Contents {
-				if c.Type == model.ContentTypeTextData {
+				if c.Type == model.ContentTypeText {
 					if system != "" {
 						system += "\n"
 					}
-					system += c.TextData
+					system += c.Text
 				}
 			}
 
 		case model.MessageRoleUser:
 			var blocks []sdk.ContentBlockParamUnion
 			for _, c := range msg.Contents {
-				switch c.Type {
-				case model.ContentTypeTextData:
-					blocks = append(blocks, sdk.NewTextBlock(c.TextData))
-				case model.ContentTypeToolResult:
-					if c.ToolResult != nil {
-						tr := c.ToolResult
-						blocks = append(blocks, sdk.NewToolResultBlock(tr.CallID, tr.Content, tr.IsError))
-					}
+				if c.Type == model.ContentTypeText {
+					blocks = append(blocks, sdk.NewTextBlock(c.Text))
 				}
 			}
 			if len(blocks) > 0 {
@@ -191,15 +221,24 @@ func convertMessages(messages []model.Message) (params []sdk.MessageParam, syste
 			var blocks []sdk.ContentBlockParamUnion
 			for _, c := range msg.Contents {
 				switch c.Type {
-				case model.ContentTypeTextData:
-					blocks = append(blocks, sdk.NewTextBlock(c.TextData))
+				case model.ContentTypeThinking:
+					if c.Thinking != nil {
+						if c.Thinking.Redacted {
+							blocks = append(blocks, sdk.NewRedactedThinkingBlock(c.Thinking.Data))
+						} else {
+							blocks = append(blocks, sdk.NewThinkingBlock(c.Thinking.Signature, c.Thinking.Text))
+						}
+					}
+				case model.ContentTypeText:
+					blocks = append(blocks, sdk.NewTextBlock(c.Text))
 				case model.ContentTypeToolCall:
 					if c.ToolCall != nil {
 						tc := c.ToolCall
-						blocks = append(blocks, sdk.NewToolUseBlock(tc.ToolID, tc.Arguments, tc.ToolName))
+						blocks = append(blocks, sdk.NewToolUseBlock(tc.ID, tc.Arguments, tc.Name))
 					}
 				}
 			}
+
 			if len(blocks) > 0 {
 				params = append(params, sdk.NewAssistantMessage(blocks...))
 			}
@@ -225,6 +264,7 @@ func convertMessages(messages []model.Message) (params []sdk.MessageParam, syste
 			}
 		}
 	}
+
 	return params, system
 }
 
@@ -237,12 +277,13 @@ func convertTools(tools []model.ToolSet) []sdk.ToolUnionParam {
 	params := make([]sdk.ToolUnionParam, len(tools))
 	for i, t := range tools {
 		tp := sdk.ToolParam{
-			Name:        t.ToolName,
+			Name:        t.Name,
 			Description: sdk.String(t.Description),
 			InputSchema: buildInputSchema(t.Parameters),
 		}
 		params[i] = sdk.ToolUnionParam{OfTool: &tp}
 	}
+
 	return params
 }
 
@@ -269,18 +310,31 @@ func buildInputSchema(params map[string]any) sdk.ToolInputSchemaParam {
 			schema.ExtraFields[k] = v
 		}
 	}
+
 	return schema
 }
 
-// extractContents 从 Messages API 响应内容块中提取文本和工具调用内容
+// extractContents 从 Messages API 响应内容块中提取文本、工具调用和思考内容
 func extractContents(blocks []sdk.ContentBlockUnion) ([]model.Content, error) {
 	var contents []model.Content
 	for _, block := range blocks {
 		switch block.Type {
+		case "thinking":
+			tb := block.AsThinking()
+			contents = append(contents, model.Content{
+				Type:     model.ContentTypeThinking,
+				Thinking: &model.ThinkingData{Text: tb.Thinking, Signature: tb.Signature},
+			})
+		case "redacted_thinking":
+			rb := block.AsRedactedThinking()
+			contents = append(contents, model.Content{
+				Type:     model.ContentTypeThinking,
+				Thinking: &model.ThinkingData{Data: rb.Data, Redacted: true},
+			})
 		case "text":
 			contents = append(contents, model.Content{
-				Type:     model.ContentTypeTextData,
-				TextData: block.AsText().Text,
+				Type: model.ContentTypeText,
+				Text: block.AsText().Text,
 			})
 		case "tool_use":
 			tu := block.AsToolUse()
@@ -291,5 +345,6 @@ func extractContents(blocks []sdk.ContentBlockUnion) ([]model.Content, error) {
 			contents = append(contents, model.Content{Type: model.ContentTypeToolCall, ToolCall: tc})
 		}
 	}
+
 	return contents, nil
 }

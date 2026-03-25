@@ -21,77 +21,63 @@ const (
 	anthropicModel = ""
 )
 
-// ── 工具定义 ──────────────────────────────────────────────────────────────────
-
-type getWeatherArgs struct {
-	City string `json:"city" desc:"城市名称" required:"true"`
-}
-
-func getWeather(args getWeatherArgs) (string, error) {
-	return `{"temperature":"25°C","condition":"晴"}`, nil
-}
-
-func newWeatherRegistry(t *testing.T) *registry.Registry {
-	t.Helper()
-	r := registry.New()
-	if err := r.Register("get_weather", "获取指定城市的当前天气", getWeather); err != nil {
-		t.Fatal(err)
-	}
-	return r
-}
-
 // ── 辅助函数 ──────────────────────────────────────────────────────────────────
-
-func newOpenAI(t *testing.T) provider.Provider {
-	t.Helper()
-	if openaiKey == "" {
-		t.Skip("openaiKey not set")
-	}
-	return openai.New(openaiKey, openaiBase, openaiModel)
-}
-
-func newAnthropic(t *testing.T) provider.Provider {
-	t.Helper()
-	if anthropicKey == "" {
-		t.Skip("anthropicKey not set")
-	}
-	return anthropic.New(anthropicKey, anthropicBase, anthropicModel, 0)
-}
 
 func eachProvider(t *testing.T, f func(t *testing.T, p provider.Provider)) {
 	t.Helper()
-	for _, tc := range []struct {
+	providers := []struct {
 		name string
-		new  func(*testing.T) provider.Provider
+		new  func() provider.Provider
+		skip func() bool
 	}{
-		{"openai", newOpenAI},
-		{"anthropic", newAnthropic},
-	} {
-		t.Run(tc.name, func(t *testing.T) { f(t, tc.new(t)) })
+		{
+			name: "openai",
+			new:  func() provider.Provider { return openai.New(openaiKey, openaiBase, openaiModel, nil) },
+			skip: func() bool { return openaiKey == "" },
+		},
+		{
+			name: "anthropic",
+			new:  func() provider.Provider { return anthropic.New(anthropicKey, anthropicBase, anthropicModel, 0, nil) },
+			skip: func() bool { return anthropicKey == "" },
+		},
+		{
+			name: "openai/thinking",
+			new: func() provider.Provider {
+				return openai.New(openaiKey, openaiBase, openaiModel, &model.ThinkingConfig{Effort: "high"})
+			},
+			skip: func() bool { return openaiKey == "" },
+		},
+		{
+			name: "anthropic/thinking",
+			new: func() provider.Provider {
+				return anthropic.New(anthropicKey, anthropicBase, anthropicModel, 16000, &model.ThinkingConfig{BudgetTokens: 5000})
+			},
+			skip: func() bool { return anthropicKey == "" },
+		},
+	}
+
+	for _, tc := range providers {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.skip() {
+				t.Skipf("%s key not set", tc.name)
+			}
+			f(t, tc.new())
+		})
 	}
 }
 
-func findToolCall(t *testing.T, contents []model.Content) *model.ToolCall {
+func drainStream(t *testing.T, ch <-chan provider.Event) {
 	t.Helper()
-	for _, c := range contents {
-		if c.Type == model.ContentTypeToolCall {
-			return c.ToolCall
-		}
-	}
-	t.Fatal("expected tool call in response")
-	return nil
-}
-
-func drainStream(t *testing.T, ch <-chan provider.Event) *model.ToolCall {
-	t.Helper()
-	var tc *model.ToolCall
 	for e := range ch {
 		switch e.Type {
+		case provider.EventTypeThinkingDelta:
+			t.Logf("[thinking_delta] %q", e.Text)
+		case provider.EventTypeThinkingDone:
+			t.Logf("[thinking_done]  redacted=%v", e.Thinking.Redacted)
 		case provider.EventTypeTextDelta:
 			t.Logf("[text_delta] %q", e.Text)
 		case provider.EventTypeToolCall:
-			tc = e.ToolCall
-			t.Logf("[tool_call]  %s %v", e.ToolCall.ToolName, e.ToolCall.Arguments)
+			t.Logf("[tool_call]  %s %v", e.ToolCall.Name, e.ToolCall.Arguments)
 		case provider.EventTypeDone:
 			if e.Usage != nil {
 				t.Logf("[done]       input=%d output=%d", e.Usage.InputTokens, e.Usage.OutputTokens)
@@ -100,32 +86,59 @@ func drainStream(t *testing.T, ch <-chan provider.Event) *model.ToolCall {
 			t.Fatalf("[error] %v", e.Err)
 		}
 	}
-	return tc
 }
 
-// ── 测试：多轮历史对话 ─────────────────────────────────────────────────────────
+func findContent(contents []model.Content, ct model.ContentType) *model.Content {
+	for i := range contents {
+		if contents[i].Type == ct {
+			return &contents[i]
+		}
+	}
+	return nil
+}
+
+func newWeatherRegistry(t *testing.T) *registry.Registry {
+	t.Helper()
+	r := registry.New()
+	if err := r.Register("get_weather", "获取指定城市的当前天气", func(args struct {
+		City string `json:"city" desc:"城市名称" required:"true"`
+	}) (string, error) {
+		return `{"temperature":"25°C","condition":"晴"}`, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+// ── 测试：多轮对话 ──────────────────────────────────────────────────────────────
 
 func TestConversation_Complete_MultiTurn(t *testing.T) {
 	eachProvider(t, func(t *testing.T, p provider.Provider) {
 		conv := provider.NewConversation(p)
 		conv.AddSystem("你是一个简洁的助手，每次回复不超过两句话。")
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 		defer cancel()
 
 		contents, _, err := conv.Complete(ctx, "我叫小明。", nil)
 		if err != nil {
 			t.Fatalf("round 1: %v", err)
 		}
-		if len(contents) > 0 {
-			t.Logf("round 1: %s", contents[0].TextData)
+		if c := findContent(contents, model.ContentTypeThinking); c != nil {
+			t.Logf("round 1 [thinking] redacted=%v text=%q", c.Thinking.Redacted, c.Thinking.Text)
+		}
+		if c := findContent(contents, model.ContentTypeText); c != nil {
+			t.Logf("round 1: %s", c.Text)
 		}
 
 		contents, _, err = conv.Complete(ctx, "我叫什么名字？", nil)
 		if err != nil {
 			t.Fatalf("round 2: %v", err)
 		}
-		if len(contents) > 0 {
-			t.Logf("round 2: %s", contents[0].TextData)
+		if c := findContent(contents, model.ContentTypeThinking); c != nil {
+			t.Logf("round 2 [thinking] redacted=%v text=%q", c.Thinking.Redacted, c.Thinking.Text)
+		}
+		if c := findContent(contents, model.ContentTypeText); c != nil {
+			t.Logf("round 2: %s", c.Text)
 		}
 	})
 }
@@ -134,7 +147,7 @@ func TestConversation_Stream_MultiTurn(t *testing.T) {
 	eachProvider(t, func(t *testing.T, p provider.Provider) {
 		conv := provider.NewConversation(p)
 		conv.AddSystem("你是一个简洁的助手，每次回复不超过两句话。")
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 		defer cancel()
 
 		ch, err := conv.Stream(ctx, "我叫小明。", nil)
@@ -151,55 +164,40 @@ func TestConversation_Stream_MultiTurn(t *testing.T) {
 	})
 }
 
-// ── 测试：工具调用 ─────────────────────────────────────────────────────────────
+// ── 测试：工具调用 ──────────────────────────────────────────────────
 
 func TestConversation_Complete_ToolCall(t *testing.T) {
 	eachProvider(t, func(t *testing.T, p provider.Provider) {
 		r := newWeatherRegistry(t)
-		conv := provider.NewConversation(p)
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		conv := provider.NewConversation(p, provider.WithToolExecutor(r))
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 		defer cancel()
 
 		contents, _, err := conv.Complete(ctx, "北京现在天气怎么样？", r.ToolSets())
 		if err != nil {
-			t.Fatalf("round 1: %v", err)
+			t.Fatalf("complete: %v", err)
 		}
-		tc := findToolCall(t, contents)
-		t.Logf("tool call: %s %v", tc.ToolName, tc.Arguments)
-
-		conv.InjectToolResults(r.Execute(*tc))
-
-		contents, _, err = conv.Complete(ctx, "", r.ToolSets())
-		if err != nil {
-			t.Fatalf("round 2: %v", err)
+		if c := findContent(contents, model.ContentTypeThinking); c != nil {
+			t.Logf("[thinking] redacted=%v text=%q", c.Thinking.Redacted, c.Thinking.Text)
 		}
-		if len(contents) > 0 {
-			t.Logf("final reply: %s", contents[0].TextData)
+		c := findContent(contents, model.ContentTypeText)
+		if c == nil {
+			t.Fatal("expected text reply after tool loop")
 		}
+		t.Logf("reply: %s", c.Text)
 	})
 }
 
 func TestConversation_Stream_ToolCall(t *testing.T) {
 	eachProvider(t, func(t *testing.T, p provider.Provider) {
 		r := newWeatherRegistry(t)
-		conv := provider.NewConversation(p)
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		conv := provider.NewConversation(p, provider.WithToolExecutor(r))
+		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 		defer cancel()
 
 		ch, err := conv.Stream(ctx, "北京现在天气怎么样？", r.ToolSets())
 		if err != nil {
-			t.Fatalf("round 1: %v", err)
-		}
-		tc := drainStream(t, ch)
-		if tc == nil {
-			t.Fatal("expected tool_call event")
-		}
-
-		conv.InjectToolResults(r.Execute(*tc))
-
-		ch, err = conv.Stream(ctx, "", r.ToolSets())
-		if err != nil {
-			t.Fatalf("round 2: %v", err)
+			t.Fatalf("stream: %v", err)
 		}
 		drainStream(t, ch)
 	})

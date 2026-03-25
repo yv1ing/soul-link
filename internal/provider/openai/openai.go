@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	sdk "github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
@@ -17,23 +18,26 @@ import (
 
 // Provider 封装 OpenAI Responses API 客户端
 type Provider struct {
-	client sdk.Client
-	model  string
+	client   sdk.Client
+	model    string
+	thinking *model.ThinkingConfig
 }
 
-// New 创建 OpenAI Provider，baseURL 为空时使用 SDK 默认地址
-func New(apiKey, baseURL, modelName string, opts ...option.RequestOption) *Provider {
+// New 创建 OpenAI Provider
+func New(apiKey, baseURL, modelName string, thinking *model.ThinkingConfig, opts ...option.RequestOption) *Provider {
 	base := []option.RequestOption{option.WithAPIKey(apiKey)}
 	if baseURL != "" {
 		base = append(base, option.WithBaseURL(baseURL))
 	}
+
 	return &Provider{
-		client: sdk.NewClient(append(base, opts...)...),
-		model:  modelName,
+		client:   sdk.NewClient(append(base, opts...)...),
+		model:    modelName,
+		thinking: thinking,
 	}
 }
 
-// Stream 发起流式请求，通过 channel 逐步投递事件，ctx 取消时 goroutine 安全退出
+// Stream 发起流式请求，通过 channel 逐步投递事件
 func (p *Provider) Stream(ctx context.Context, messages []model.Message, tools []model.ToolSet) (<-chan provider.Event, error) {
 	req, err := p.buildRequest(messages, tools)
 	if err != nil {
@@ -66,20 +70,33 @@ func (p *Provider) Stream(ctx context.Context, messages []model.Message, tools [
 					return
 				}
 
-			case "response.output_item.done":
-				item := event.AsResponseOutputItemDone().Item
-				if item.Type != "function_call" {
-					continue
+			case "response.reasoning_summary_text.delta":
+				if !send(provider.Event{
+					Type: provider.EventTypeThinkingDelta,
+					Text: event.AsResponseReasoningSummaryTextDelta().Delta,
+				}) {
+					return
 				}
 
-				fc := item.AsFunctionCall()
-				tc, err := provider.ParseToolCall(fc.CallID, fc.Name, fc.Arguments)
-				if err != nil {
-					send(provider.Event{Type: provider.EventTypeError, Err: err})
-					return
-				}
-				if !send(provider.Event{Type: provider.EventTypeToolCall, ToolCall: tc}) {
-					return
+			case "response.output_item.done":
+				item := event.AsResponseOutputItemDone().Item
+				switch item.Type {
+				case "function_call":
+					fc := item.AsFunctionCall()
+					tc, err := provider.ParseToolCall(fc.CallID, fc.Name, fc.Arguments)
+					if err != nil {
+						send(provider.Event{Type: provider.EventTypeError, Err: err})
+						return
+					}
+					if !send(provider.Event{Type: provider.EventTypeToolCall, ToolCall: tc}) {
+						return
+					}
+				case "reasoning":
+					ri := item.AsReasoning()
+					td := extractReasoningData(ri)
+					if !send(provider.Event{Type: provider.EventTypeThinkingDone, Thinking: td}) {
+						return
+					}
 				}
 
 			case "response.completed":
@@ -108,6 +125,7 @@ func (p *Provider) Complete(ctx context.Context, messages []model.Message, tools
 	if err != nil {
 		return nil, nil, err
 	}
+
 	resp, err := p.client.Responses.New(ctx, req)
 	if err != nil {
 		return nil, nil, err
@@ -128,6 +146,7 @@ func (p *Provider) buildRequest(messages []model.Message, tools []model.ToolSet)
 	if err != nil {
 		return responses.ResponseNewParams{}, err
 	}
+
 	req := responses.ResponseNewParams{
 		Model: shared.ResponsesModel(p.model),
 		Input: responses.ResponseNewParamsInputUnion{OfInputItemList: input},
@@ -137,6 +156,14 @@ func (p *Provider) buildRequest(messages []model.Message, tools []model.ToolSet)
 	if instructions != "" {
 		req.Instructions = sdk.String(instructions)
 	}
+
+	if p.thinking != nil && p.thinking.Effort != "" {
+		req.Reasoning = shared.ReasoningParam{
+			Effort:  shared.ReasoningEffort(p.thinking.Effort),
+			Summary: shared.ReasoningSummaryConcise,
+		}
+	}
+
 	return req, nil
 }
 
@@ -146,52 +173,51 @@ func convertMessages(messages []model.Message) (responses.ResponseInputParam, st
 		instructions string
 		items        []responses.ResponseInputItemUnionParam
 	)
+
 	for _, msg := range messages {
 		switch msg.Role {
 
 		case model.MessageRoleSystem:
 			for _, c := range msg.Contents {
-				if c.Type == model.ContentTypeTextData {
+				if c.Type == model.ContentTypeText {
 					if instructions != "" {
 						instructions += "\n"
 					}
-					instructions += c.TextData
+					instructions += c.Text
 				}
 			}
 
 		case model.MessageRoleUser:
-			var pendingText string
+			var text string
 			for _, c := range msg.Contents {
-				switch c.Type {
-				case model.ContentTypeTextData:
-					if pendingText != "" {
-						pendingText += "\n"
+				if c.Type == model.ContentTypeText {
+					if text != "" {
+						text += "\n"
 					}
-					pendingText += c.TextData
-				case model.ContentTypeToolResult:
-					if c.ToolResult == nil {
-						continue
-					}
-					if pendingText != "" {
-						items = append(items, responses.ResponseInputItemParamOfMessage(pendingText, responses.EasyInputMessageRoleUser))
-						pendingText = ""
-					}
-					items = append(items, toolResultOutput(c.ToolResult))
+					text += c.Text
 				}
 			}
-			if pendingText != "" {
-				items = append(items, responses.ResponseInputItemParamOfMessage(pendingText, responses.EasyInputMessageRoleUser))
+			if text != "" {
+				items = append(items, responses.ResponseInputItemParamOfMessage(text, responses.EasyInputMessageRoleUser))
 			}
 
 		case model.MessageRoleAssistant:
 			var pendingText string
 			for _, c := range msg.Contents {
 				switch c.Type {
-				case model.ContentTypeTextData:
+				case model.ContentTypeThinking:
+					if c.Thinking != nil && c.Thinking.ID != "" {
+						if pendingText != "" {
+							items = append(items, responses.ResponseInputItemParamOfMessage(pendingText, responses.EasyInputMessageRoleAssistant))
+							pendingText = ""
+						}
+						items = append(items, responses.ResponseInputItemParamOfReasoning(c.Thinking.ID, splitSummaries(c.Thinking.Text)))
+					}
+				case model.ContentTypeText:
 					if pendingText != "" {
 						pendingText += "\n"
 					}
-					pendingText += c.TextData
+					pendingText += c.Text
 				case model.ContentTypeToolCall:
 					if c.ToolCall == nil {
 						continue
@@ -203,17 +229,18 @@ func convertMessages(messages []model.Message) (responses.ResponseInputParam, st
 					tc := c.ToolCall
 					argsJSON, err := json.Marshal(tc.Arguments)
 					if err != nil {
-						return nil, "", fmt.Errorf("marshal tool %q args: %w", tc.ToolName, err)
+						return nil, "", fmt.Errorf("marshal tool %q args: %w", tc.Name, err)
 					}
 					items = append(items, responses.ResponseInputItemUnionParam{
 						OfFunctionCall: &responses.ResponseFunctionToolCallParam{
-							CallID:    tc.ToolID,
-							Name:      tc.ToolName,
+							CallID:    tc.ID,
+							Name:      tc.Name,
 							Arguments: string(argsJSON),
 						},
 					})
 				}
 			}
+
 			if pendingText != "" {
 				items = append(items, responses.ResponseInputItemParamOfMessage(pendingText, responses.EasyInputMessageRoleAssistant))
 			}
@@ -222,11 +249,12 @@ func convertMessages(messages []model.Message) (responses.ResponseInputParam, st
 			for _, c := range msg.Contents {
 				if c.Type == model.ContentTypeToolResult && c.ToolResult != nil {
 					tr := c.ToolResult
-					items = append(items, toolResultOutput(tr))
+					items = append(items, convertToolResult(tr))
 				}
 			}
 		}
 	}
+
 	return responses.ResponseInputParam(items), instructions, nil
 }
 
@@ -239,36 +267,44 @@ func convertTools(tools []model.ToolSet) []responses.ToolUnionParam {
 	params := make([]responses.ToolUnionParam, len(tools))
 	for i, t := range tools {
 		fp := responses.FunctionToolParam{
-			Name:        t.ToolName,
+			Name:        t.Name,
 			Parameters:  t.Parameters,
 			Description: param.NewOpt(t.Description),
 			Strict:      param.NewOpt(false),
 		}
 		params[i] = responses.ToolUnionParam{OfFunction: &fp}
 	}
+
 	return params
 }
 
-// toolResultOutput 将 ToolResult 转换为 Responses API 的 function_call_output 输入项。
-func toolResultOutput(tr *model.ToolResult) responses.ResponseInputItemUnionParam {
+// convertToolResult 将 ToolResult 转换为 Responses API 的 function_call_output 输入项
+func convertToolResult(tr *model.ToolResult) responses.ResponseInputItemUnionParam {
 	output := tr.Content
 	if tr.IsError {
 		output = "[ERROR] " + output
 	}
+
 	return responses.ResponseInputItemParamOfFunctionCallOutput(tr.CallID, output)
 }
 
-// extractContents 从 Responses API 输出项中提取文本和工具调用内容
+// extractContents 从 Responses API 输出项中提取文本、工具调用和推理内容
 func extractContents(items []responses.ResponseOutputItemUnion) ([]model.Content, error) {
 	var contents []model.Content
 	for _, item := range items {
 		switch item.Type {
+		case "reasoning":
+			ri := item.AsReasoning()
+			contents = append(contents, model.Content{
+				Type:     model.ContentTypeThinking,
+				Thinking: extractReasoningData(ri),
+			})
 		case "message":
 			for _, part := range item.AsMessage().Content {
 				if part.Type == "output_text" {
 					contents = append(contents, model.Content{
-						Type:     model.ContentTypeTextData,
-						TextData: part.AsOutputText().Text,
+						Type: model.ContentTypeText,
+						Text: part.AsOutputText().Text,
 					})
 				}
 			}
@@ -281,5 +317,34 @@ func extractContents(items []responses.ResponseOutputItemUnion) ([]model.Content
 			contents = append(contents, model.Content{Type: model.ContentTypeToolCall, ToolCall: tc})
 		}
 	}
+
 	return contents, nil
+}
+
+// extractReasoningData 从 ResponseReasoningItem 中提取推理数据
+func extractReasoningData(ri responses.ResponseReasoningItem) *model.ThinkingData {
+	var text string
+	for _, s := range ri.Summary {
+		if text != "" {
+			text += "\n"
+		}
+		text += s.Text
+	}
+
+	return &model.ThinkingData{ID: ri.ID, Text: text}
+}
+
+// splitSummaries 将文本按行分割为 ResponseReasoningItemSummaryParam 切片
+func splitSummaries(text string) []responses.ResponseReasoningItemSummaryParam {
+	if text == "" {
+		return []responses.ResponseReasoningItemSummaryParam{}
+	}
+
+	lines := strings.Split(text, "\n")
+	summaries := make([]responses.ResponseReasoningItemSummaryParam, len(lines))
+	for i, line := range lines {
+		summaries[i] = responses.ResponseReasoningItemSummaryParam{Text: line}
+	}
+
+	return summaries
 }

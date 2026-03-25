@@ -4,13 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"unicode/utf8"
 
 	"soul-link/internal/model"
 )
 
-const defaultSummaryPrompt = "请将以下对话历史简洁地总结为一段摘要，保留关键信息和结论，使用与对话相同的语言。"
+const defaultSummaryPrompt = "请将以下对话历史简洁地总结为一段摘要，保留关键信息和结论。使用与对话相同的语言。"
 
-// WithCompression 启用历史摘要压缩。summaryPrompt 为空时使用默认提示词。
+// WithCompression 启用历史摘要压缩
 func WithCompression(maxTokens, keepRecent int, summaryPrompt string) ConversationOption {
 	return func(c *Conversation) {
 		if summaryPrompt == "" {
@@ -30,27 +31,31 @@ type compressionConfig struct {
 	summaryPrompt string
 }
 
-// estimateTokens 通过字节数 / 3 估算消息列表的 token 数量。
+// estimateTokens 估算消息列表的 token 数量。
+// 文本使用 rune 计数（对中日韩文字准确，对 ASCII 略高估但更安全），
+// JSON 结构体使用字节数 / 4（ASCII 主导，4 chars ≈ 1 token）。
 func estimateTokens(msgs []model.Message) int {
 	var n int
 	for _, msg := range msgs {
 		for _, c := range msg.Contents {
-			n += len(c.TextData) / 3
+			n += utf8.RuneCountInString(c.Text)
 			if c.ToolCall != nil {
-				n += len(c.ToolCall.ToolName) / 3
 				if b, err := json.Marshal(c.ToolCall.Arguments); err == nil {
-					n += len(b) / 3
+					n += len(b) / 4
 				}
 			}
 			if c.ToolResult != nil {
-				n += len(c.ToolResult.Content) / 3
+				n += utf8.RuneCountInString(c.ToolResult.Content)
+			}
+			if c.Thinking != nil {
+				n += utf8.RuneCountInString(c.Thinking.Text)
 			}
 		}
 	}
 	return n
 }
 
-// maybeCompress 检查 base 是否超出 token 限制，超出时调用 LLM 将旧消息压缩为摘要。
+// maybeCompress 检查 base 是否超出 token 限制，超出时调用 LLM 将旧消息压缩为摘要
 func (c *Conversation) maybeCompress(ctx context.Context, base []model.Message) ([]model.Message, bool, error) {
 	cfg := c.compress
 	if cfg == nil || cfg.maxTokens <= 0 || estimateTokens(base) <= cfg.maxTokens {
@@ -77,8 +82,7 @@ func (c *Conversation) maybeCompress(ctx context.Context, base []model.Message) 
 	for splitAt > 0 && convMsgs[splitAt].Role != model.MessageRoleUser {
 		splitAt--
 	}
-	// 确保 old 末尾是 assistant（而非 tool），否则摘要请求末尾会出现两条连续 user 消息
-	// （tool 角色在各 provider 转换后成为 user 消息，随后摘要提示词也是 user 消息）
+
 	for splitAt > 0 && convMsgs[splitAt-1].Role == model.MessageRoleTool {
 		splitAt--
 		for splitAt > 0 && convMsgs[splitAt].Role != model.MessageRoleUser {
@@ -97,7 +101,7 @@ func (c *Conversation) maybeCompress(ctx context.Context, base []model.Message) 
 	summaryReq = append(summaryReq, old...)
 	summaryReq = append(summaryReq, model.Message{
 		Role:     model.MessageRoleUser,
-		Contents: []model.Content{{Type: model.ContentTypeTextData, TextData: cfg.summaryPrompt}},
+		Contents: []model.Content{{Type: model.ContentTypeText, Text: cfg.summaryPrompt}},
 	})
 
 	contents, _, err := c.provider.Complete(ctx, summaryReq, nil)
@@ -107,8 +111,8 @@ func (c *Conversation) maybeCompress(ctx context.Context, base []model.Message) 
 
 	var summaryText string
 	for _, ct := range contents {
-		if ct.Type == model.ContentTypeTextData && ct.TextData != "" {
-			summaryText = ct.TextData
+		if ct.Type == model.ContentTypeText && ct.Text != "" {
+			summaryText = ct.Text
 			break
 		}
 	}
@@ -118,12 +122,13 @@ func (c *Conversation) maybeCompress(ctx context.Context, base []model.Message) 
 
 	summaryMsg := model.Message{
 		Role:     model.MessageRoleSystem,
-		Contents: []model.Content{{Type: model.ContentTypeTextData, TextData: "对话摘要：\n" + summaryText}},
+		Contents: []model.Content{{Type: model.ContentTypeText, Text: "对话摘要：\n" + summaryText}},
 	}
 
 	compressed := make([]model.Message, 0, len(sysMsgs)+1+len(recent))
 	compressed = append(compressed, sysMsgs...)
 	compressed = append(compressed, summaryMsg)
 	compressed = append(compressed, recent...)
+
 	return compressed, true, nil
 }

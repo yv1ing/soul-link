@@ -36,17 +36,17 @@ func (r *Registry) ToolSets() []model.ToolSet {
 }
 
 func (r *Registry) Execute(call model.ToolCall) model.ToolResult {
-	ft, ok := r.tools[call.ToolName]
+	ft, ok := r.tools[call.Name]
 	if !ok {
 		return model.ToolResult{
-			CallID:  call.ToolID,
+			CallID:  call.ID,
 			IsError: true,
-			Content: fmt.Sprintf("unknown tool: %q", call.ToolName),
+			Content: fmt.Sprintf("unknown tool: %q", call.Name),
 		}
 	}
 	result, err := ft.handler(call.Arguments)
 	if err != nil {
-		return model.ToolResult{CallID: call.ToolID, IsError: true, Content: err.Error()}
+		return model.ToolResult{CallID: call.ID, IsError: true, Content: err.Error()}
 	}
-	return model.ToolResult{CallID: call.ToolID, Content: result}
+	return model.ToolResult{CallID: call.ID, Content: result}
 }

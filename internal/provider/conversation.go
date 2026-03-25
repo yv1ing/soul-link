@@ -8,16 +8,31 @@ import (
 	"soul-link/internal/model"
 )
 
+// ToolExecutor 提供工具同步执行能力
+type ToolExecutor interface {
+	Execute(call model.ToolCall) model.ToolResult
+}
+
+const maxToolIterations = 10
+
 // Conversation 在 Provider 之上维护多轮对话历史
 type Conversation struct {
 	mu       sync.Mutex
 	provider Provider
 	history  []model.Message
 	compress *compressionConfig
+	executor ToolExecutor
 }
 
 // ConversationOption 用于配置 Conversation
 type ConversationOption func(*Conversation)
+
+// WithToolExecutor 启用内置 tool call loop，工具调用由 exec 自动执行并注入结果
+func WithToolExecutor(exec ToolExecutor) ConversationOption {
+	return func(c *Conversation) {
+		c.executor = exec
+	}
+}
 
 // NewConversation 创建新的对话实例
 func NewConversation(p Provider, opts ...ConversationOption) *Conversation {
@@ -34,12 +49,61 @@ func (c *Conversation) AddSystem(text string) {
 	defer c.mu.Unlock()
 	c.history = append(c.history, model.Message{
 		Role:     model.MessageRoleSystem,
-		Contents: []model.Content{{Type: model.ContentTypeTextData, TextData: text}},
+		Contents: []model.Content{{Type: model.ContentTypeText, Text: text}},
 	})
 }
 
-// Complete 发起非流式请求；成功后将用户消息和助手回复一次性写入历史
+// Complete 发起非流式请求
 func (c *Conversation) Complete(ctx context.Context, userText string, tools []model.ToolSet) ([]model.Content, *model.Usage, error) {
+	if c.executor == nil || len(tools) == 0 {
+		return c.completeOnce(ctx, userText, tools)
+	}
+
+	var totalUsage model.Usage
+	text := userText
+
+	for range maxToolIterations {
+		contents, usage, err := c.completeOnce(ctx, text, tools)
+		if err != nil {
+			return nil, nil, err
+		}
+		if usage != nil {
+			totalUsage.InputTokens += usage.InputTokens
+			totalUsage.OutputTokens += usage.OutputTokens
+		}
+		text = ""
+
+		var calls []model.ToolCall
+		for _, ct := range contents {
+			if ct.Type == model.ContentTypeToolCall && ct.ToolCall != nil {
+				calls = append(calls, *ct.ToolCall)
+			}
+		}
+		if len(calls) == 0 {
+			return contents, &totalUsage, nil
+		}
+
+		results := make([]model.ToolResult, len(calls))
+		for i, call := range calls {
+			results[i] = c.executor.Execute(call)
+		}
+		c.InjectToolResults(results...)
+	}
+
+	// 超出最大迭代次数，最后一次不带工具强制获取文本回复
+	contents, usage, err := c.completeOnce(ctx, "", nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	if usage != nil {
+		totalUsage.InputTokens += usage.InputTokens
+		totalUsage.OutputTokens += usage.OutputTokens
+	}
+	return contents, &totalUsage, nil
+}
+
+// completeOnce 执行单轮非流式请求并将用户消息和助手回复写入历史
+func (c *Conversation) completeOnce(ctx context.Context, userText string, tools []model.ToolSet) ([]model.Content, *model.Usage, error) {
 	c.mu.Lock()
 	base := c.snapshot()
 	c.mu.Unlock()
@@ -48,7 +112,7 @@ func (c *Conversation) Complete(ctx context.Context, userText string, tools []mo
 	if userText != "" {
 		msg := model.Message{
 			Role:     model.MessageRoleUser,
-			Contents: []model.Content{{Type: model.ContentTypeTextData, TextData: userText}},
+			Contents: []model.Content{{Type: model.ContentTypeText, Text: userText}},
 		}
 		userMsg = &msg
 	}
@@ -84,8 +148,90 @@ func (c *Conversation) Complete(ctx context.Context, userText string, tools []mo
 	return contents, usage, nil
 }
 
-// Stream 发起流式请求；收到 EventTypeDone 后将用户消息和助手回复一次性写入历史
+// Stream 发起流式请求
 func (c *Conversation) Stream(ctx context.Context, userText string, tools []model.ToolSet) (<-chan Event, error) {
+	firstStream, err := c.streamOnce(ctx, userText, tools)
+	if err != nil {
+		return nil, err
+	}
+
+	if c.executor == nil || len(tools) == 0 {
+		return firstStream, nil
+	}
+
+	out := make(chan Event, 16)
+	go func() {
+		defer close(out)
+
+		send := func(e Event) bool {
+			select {
+			case out <- e:
+				return true
+			case <-ctx.Done():
+				return false
+			}
+		}
+
+		upstream := firstStream
+		for iter := range maxToolIterations {
+			var toolCalls []model.ToolCall
+
+			for e := range upstream {
+				if e.Type == EventTypeToolCall && e.ToolCall != nil {
+					toolCalls = append(toolCalls, *e.ToolCall)
+				}
+				if e.Type == EventTypeError {
+					send(e)
+					return
+				}
+				if !send(e) {
+					return
+				}
+			}
+
+			if len(toolCalls) == 0 {
+				return
+			}
+
+			results := make([]model.ToolResult, len(toolCalls))
+			for i, call := range toolCalls {
+				results[i] = c.executor.Execute(call)
+			}
+			c.InjectToolResults(results...)
+
+			// 达到最大迭代次数，最后一次不带工具强制获取文本回复
+			if iter+1 >= maxToolIterations {
+				final, err := c.streamOnce(ctx, "", nil)
+				if err != nil {
+					send(Event{Type: EventTypeError, Err: err})
+					return
+				}
+				for e := range final {
+					if e.Type == EventTypeError {
+						send(e)
+						return
+					}
+					if !send(e) {
+						return
+					}
+				}
+				return
+			}
+
+			next, err := c.streamOnce(ctx, "", tools)
+			if err != nil {
+				send(Event{Type: EventTypeError, Err: err})
+				return
+			}
+			upstream = next
+		}
+	}()
+
+	return out, nil
+}
+
+// streamOnce 执行单轮流式请求，收到 EventTypeDone 后将用户消息和助手回复写入历史
+func (c *Conversation) streamOnce(ctx context.Context, userText string, tools []model.ToolSet) (<-chan Event, error) {
 	c.mu.Lock()
 	base := c.snapshot()
 	c.mu.Unlock()
@@ -94,7 +240,7 @@ func (c *Conversation) Stream(ctx context.Context, userText string, tools []mode
 	if userText != "" {
 		msg := model.Message{
 			Role:     model.MessageRoleUser,
-			Contents: []model.Content{{Type: model.ContentTypeTextData, TextData: userText}},
+			Contents: []model.Content{{Type: model.ContentTypeText, Text: userText}},
 		}
 		userMsg = &msg
 	}
@@ -128,20 +274,21 @@ func (c *Conversation) Stream(ctx context.Context, userText string, tools []mode
 		}
 
 		var (
-			textBuf   strings.Builder
-			toolCalls []model.Content
+			textBuf        strings.Builder
+			thinkingBlocks []model.Content
+			toolCallBlocks []model.Content
 		)
 
-		// commitHistory 将已累积的内容写入对话历史
 		commitHistory := func() {
 			var contents []model.Content
+			contents = append(contents, thinkingBlocks...)
 			if textBuf.Len() > 0 {
 				contents = append(contents, model.Content{
-					Type:     model.ContentTypeTextData,
-					TextData: textBuf.String(),
+					Type: model.ContentTypeText,
+					Text: textBuf.String(),
 				})
 			}
-			contents = append(contents, toolCalls...)
+			contents = append(contents, toolCallBlocks...)
 			c.mu.Lock()
 			if wasCompressed {
 				c.history = compressed
@@ -156,27 +303,33 @@ func (c *Conversation) Stream(ctx context.Context, userText string, tools []mode
 			c.mu.Unlock()
 		}
 
-		var committed bool
+		var committed, hasError bool
 		for e := range upstream {
 			switch e.Type {
+			case EventTypeThinkingDone:
+				thinkingBlocks = append(thinkingBlocks, model.Content{
+					Type:     model.ContentTypeThinking,
+					Thinking: e.Thinking,
+				})
 			case EventTypeTextDelta:
 				textBuf.WriteString(e.Text)
 			case EventTypeToolCall:
-				toolCalls = append(toolCalls, model.Content{
+				toolCallBlocks = append(toolCallBlocks, model.Content{
 					Type:     model.ContentTypeToolCall,
 					ToolCall: e.ToolCall,
 				})
 			case EventTypeDone:
 				commitHistory()
 				committed = true
+			case EventTypeError:
+				hasError = true
 			}
 			if !send(e) {
 				return
 			}
 		}
 
-		// 流异常结束（未收到 Done）：若已有部分内容则提交，保持历史与用户所见一致
-		if !committed && (textBuf.Len() > 0 || len(toolCalls) > 0) {
+		if !committed && !hasError && (textBuf.Len() > 0 || len(toolCallBlocks) > 0 || len(thinkingBlocks) > 0) {
 			commitHistory()
 		}
 	}()
@@ -218,7 +371,6 @@ func (c *Conversation) Reset() {
 	c.history = nil
 }
 
-// snapshot 返回当前历史的浅拷贝，调用前必须持有锁
 func (c *Conversation) snapshot() []model.Message {
 	s := make([]model.Message, len(c.history))
 	copy(s, c.history)

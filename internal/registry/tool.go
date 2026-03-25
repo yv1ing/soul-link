@@ -42,7 +42,7 @@ func newFuncTool(name, description string, fn any) (*funcTool, error) {
 	fnVal := reflect.ValueOf(fn)
 	return &funcTool{
 		set: model.ToolSet{
-			ToolName:    name,
+			Name:        name,
 			Description: description,
 			Parameters:  params,
 		},
@@ -70,13 +70,19 @@ func schemaFromStruct(t reflect.Type) (map[string]any, []any) {
 
 	for i := range t.NumField() {
 		field := t.Field(i)
+		if !field.IsExported() {
+			continue
+		}
 
 		name := strings.Split(field.Tag.Get("json"), ",")[0]
-		if name == "" || name == "-" {
+		if name == "-" {
+			continue
+		}
+		if name == "" {
 			name = strings.ToLower(field.Name)
 		}
 
-		prop := map[string]any{"type": jsonType(field.Type)}
+		prop := schemaForType(field.Type)
 		if desc := field.Tag.Get("desc"); desc != "" {
 			prop["description"] = desc
 		}
@@ -98,20 +104,30 @@ func schemaFromStruct(t reflect.Type) (map[string]any, []any) {
 	return props, required
 }
 
-func jsonType(t reflect.Type) string {
+func schemaForType(t reflect.Type) map[string]any {
+	if t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
 	switch t.Kind() {
 	case reflect.String:
-		return "string"
+		return map[string]any{"type": "string"}
 	case reflect.Bool:
-		return "boolean"
+		return map[string]any{"type": "boolean"}
 	case reflect.Float32, reflect.Float64:
-		return "number"
+		return map[string]any{"type": "number"}
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
 		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		return "integer"
+		return map[string]any{"type": "integer"}
 	case reflect.Slice, reflect.Array:
-		return "array"
+		return map[string]any{"type": "array", "items": schemaForType(t.Elem())}
+	case reflect.Struct:
+		props, req := schemaFromStruct(t)
+		s := map[string]any{"type": "object", "properties": props}
+		if len(req) > 0 {
+			s["required"] = req
+		}
+		return s
 	default:
-		return "object"
+		return map[string]any{"type": "object"}
 	}
 }

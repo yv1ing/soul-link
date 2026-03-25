@@ -1,24 +1,20 @@
 package model
 
-/**
- * 工具定义
- */
-
-// 函数工具定义
+// ToolSet 描述单个函数工具的定义
 type ToolSet struct {
+	Name        string         `json:"name"`
 	Description string         `json:"description"`
-	ToolName    string         `json:"tool_name"`
 	Parameters  map[string]any `json:"parameters"`
 }
 
-// 工具调用请求
+// ToolCall 表示模型发起的工具调用请求
 type ToolCall struct {
-	ToolID    string         `json:"tool_id"`
-	ToolName  string         `json:"tool_name"`
+	ID        string         `json:"id"`
+	Name      string         `json:"name"`
 	Arguments map[string]any `json:"arguments"`
 }
 
-// 工具执行结果
+// ToolResult 表示工具执行结果
 type ToolResult struct {
 	CallID  string `json:"call_id"`
 	IsError bool   `json:"is_error"`
