@@ -27,16 +27,19 @@ func New(apiKey, baseURL, modelName string, opts ...option.RequestOption) *Provi
 	if baseURL != "" {
 		base = append(base, option.WithBaseURL(baseURL))
 	}
-	opts = append(base, opts...)
 	return &Provider{
-		client: sdk.NewClient(opts...),
+		client: sdk.NewClient(append(base, opts...)...),
 		model:  modelName,
 	}
 }
 
 // Stream 发起流式请求，通过 channel 逐步投递事件，ctx 取消时 goroutine 安全退出
 func (p *Provider) Stream(ctx context.Context, messages []model.Message, tools []model.ToolSet) (<-chan provider.Event, error) {
-	stream := p.client.Responses.NewStreaming(ctx, p.buildRequest(messages, tools))
+	req, err := p.buildRequest(messages, tools)
+	if err != nil {
+		return nil, err
+	}
+	stream := p.client.Responses.NewStreaming(ctx, req)
 
 	ch := make(chan provider.Event, 16)
 	go func() {
@@ -70,7 +73,7 @@ func (p *Provider) Stream(ctx context.Context, messages []model.Message, tools [
 				}
 
 				fc := item.AsFunctionCall()
-				tc, err := parseToolCall(fc.CallID, fc.Name, fc.Arguments)
+				tc, err := provider.ParseToolCall(fc.CallID, fc.Name, fc.Arguments)
 				if err != nil {
 					send(provider.Event{Type: provider.EventTypeError, Err: err})
 					return
@@ -101,7 +104,11 @@ func (p *Provider) Stream(ctx context.Context, messages []model.Message, tools [
 
 // Complete 发起非流式请求，返回完整内容列表和用量统计
 func (p *Provider) Complete(ctx context.Context, messages []model.Message, tools []model.ToolSet) ([]model.Content, *model.Usage, error) {
-	resp, err := p.client.Responses.New(ctx, p.buildRequest(messages, tools))
+	req, err := p.buildRequest(messages, tools)
+	if err != nil {
+		return nil, nil, err
+	}
+	resp, err := p.client.Responses.New(ctx, req)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -116,8 +123,11 @@ func (p *Provider) Complete(ctx context.Context, messages []model.Message, tools
 }
 
 // buildRequest 将通用消息和工具定义组装为 Responses API 请求参数
-func (p *Provider) buildRequest(messages []model.Message, tools []model.ToolSet) responses.ResponseNewParams {
-	input, instructions := convertMessages(messages)
+func (p *Provider) buildRequest(messages []model.Message, tools []model.ToolSet) (responses.ResponseNewParams, error) {
+	input, instructions, err := convertMessages(messages)
+	if err != nil {
+		return responses.ResponseNewParams{}, err
+	}
 	req := responses.ResponseNewParams{
 		Model: shared.ResponsesModel(p.model),
 		Input: responses.ResponseNewParamsInputUnion{OfInputItemList: input},
@@ -127,11 +137,11 @@ func (p *Provider) buildRequest(messages []model.Message, tools []model.ToolSet)
 	if instructions != "" {
 		req.Instructions = sdk.String(instructions)
 	}
-	return req
+	return req, nil
 }
 
 // convertMessages 将通用消息历史转换为 Responses API 输入格式
-func convertMessages(messages []model.Message) (responses.ResponseInputParam, string) {
+func convertMessages(messages []model.Message) (responses.ResponseInputParam, string, error) {
 	var (
 		instructions string
 		items        []responses.ResponseInputItemUnionParam
@@ -150,52 +160,52 @@ func convertMessages(messages []model.Message) (responses.ResponseInputParam, st
 			}
 
 		case model.MessageRoleUser:
-			var (
-				text      string
-				toolItems []responses.ResponseInputItemUnionParam
-			)
+			var pendingText string
 			for _, c := range msg.Contents {
 				switch c.Type {
 				case model.ContentTypeTextData:
-					if text != "" {
-						text += "\n"
+					if pendingText != "" {
+						pendingText += "\n"
 					}
-					text += c.TextData
+					pendingText += c.TextData
 				case model.ContentTypeToolResult:
-					if c.ToolResult != nil {
-						tr := c.ToolResult
-						toolItems = append(toolItems, responses.ResponseInputItemParamOfFunctionCallOutput(tr.CallID, tr.Content))
+					if c.ToolResult == nil {
+						continue
 					}
+					if pendingText != "" {
+						items = append(items, responses.ResponseInputItemParamOfMessage(pendingText, responses.EasyInputMessageRoleUser))
+						pendingText = ""
+					}
+					items = append(items, toolResultOutput(c.ToolResult))
 				}
 			}
-			if text != "" {
-				items = append(items, responses.ResponseInputItemParamOfMessage(text, responses.EasyInputMessageRoleUser))
+			if pendingText != "" {
+				items = append(items, responses.ResponseInputItemParamOfMessage(pendingText, responses.EasyInputMessageRoleUser))
 			}
-			items = append(items, toolItems...)
 
 		case model.MessageRoleAssistant:
-			var (
-				text      string
-				toolItems []responses.ResponseInputItemUnionParam
-			)
+			var pendingText string
 			for _, c := range msg.Contents {
 				switch c.Type {
 				case model.ContentTypeTextData:
-					if text != "" {
-						text += "\n"
+					if pendingText != "" {
+						pendingText += "\n"
 					}
-					text += c.TextData
+					pendingText += c.TextData
 				case model.ContentTypeToolCall:
 					if c.ToolCall == nil {
 						continue
 					}
+					if pendingText != "" {
+						items = append(items, responses.ResponseInputItemParamOfMessage(pendingText, responses.EasyInputMessageRoleAssistant))
+						pendingText = ""
+					}
 					tc := c.ToolCall
-
 					argsJSON, err := json.Marshal(tc.Arguments)
 					if err != nil {
-						continue
+						return nil, "", fmt.Errorf("marshal tool %q args: %w", tc.ToolName, err)
 					}
-					toolItems = append(toolItems, responses.ResponseInputItemUnionParam{
+					items = append(items, responses.ResponseInputItemUnionParam{
 						OfFunctionCall: &responses.ResponseFunctionToolCallParam{
 							CallID:    tc.ToolID,
 							Name:      tc.ToolName,
@@ -204,22 +214,20 @@ func convertMessages(messages []model.Message) (responses.ResponseInputParam, st
 					})
 				}
 			}
-
-			if text != "" {
-				items = append(items, responses.ResponseInputItemParamOfMessage(text, responses.EasyInputMessageRoleAssistant))
+			if pendingText != "" {
+				items = append(items, responses.ResponseInputItemParamOfMessage(pendingText, responses.EasyInputMessageRoleAssistant))
 			}
-			items = append(items, toolItems...)
 
 		case model.MessageRoleTool:
 			for _, c := range msg.Contents {
 				if c.Type == model.ContentTypeToolResult && c.ToolResult != nil {
 					tr := c.ToolResult
-					items = append(items, responses.ResponseInputItemParamOfFunctionCallOutput(tr.CallID, tr.Content))
+					items = append(items, toolResultOutput(tr))
 				}
 			}
 		}
 	}
-	return responses.ResponseInputParam(items), instructions
+	return responses.ResponseInputParam(items), instructions, nil
 }
 
 // convertTools 将通用工具定义转换为 Responses API function tool 参数
@@ -241,6 +249,15 @@ func convertTools(tools []model.ToolSet) []responses.ToolUnionParam {
 	return params
 }
 
+// toolResultOutput 将 ToolResult 转换为 Responses API 的 function_call_output 输入项。
+func toolResultOutput(tr *model.ToolResult) responses.ResponseInputItemUnionParam {
+	output := tr.Content
+	if tr.IsError {
+		output = "[ERROR] " + output
+	}
+	return responses.ResponseInputItemParamOfFunctionCallOutput(tr.CallID, output)
+}
+
 // extractContents 从 Responses API 输出项中提取文本和工具调用内容
 func extractContents(items []responses.ResponseOutputItemUnion) ([]model.Content, error) {
 	var contents []model.Content
@@ -257,7 +274,7 @@ func extractContents(items []responses.ResponseOutputItemUnion) ([]model.Content
 			}
 		case "function_call":
 			fc := item.AsFunctionCall()
-			tc, err := parseToolCall(fc.CallID, fc.Name, fc.Arguments)
+			tc, err := provider.ParseToolCall(fc.CallID, fc.Name, fc.Arguments)
 			if err != nil {
 				return nil, err
 			}
@@ -265,16 +282,4 @@ func extractContents(items []responses.ResponseOutputItemUnion) ([]model.Content
 		}
 	}
 	return contents, nil
-}
-
-// parseToolCall 将工具调用的 JSON 字符串参数解析为结构化 ToolCall
-func parseToolCall(id, name, rawJSON string) (*model.ToolCall, error) {
-	if rawJSON == "" {
-		rawJSON = "{}"
-	}
-	var args map[string]any
-	if err := json.Unmarshal([]byte(rawJSON), &args); err != nil {
-		return nil, fmt.Errorf("parse tool %q args: %w", name, err)
-	}
-	return &model.ToolCall{ToolID: id, ToolName: name, Arguments: args}, nil
 }

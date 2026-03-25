@@ -10,9 +10,6 @@ import (
 
 const defaultSummaryPrompt = "请将以下对话历史简洁地总结为一段摘要，保留关键信息和结论，使用与对话相同的语言。"
 
-// ConversationOption 用于配置 Conversation
-type ConversationOption func(*Conversation)
-
 // WithCompression 启用历史摘要压缩。summaryPrompt 为空时使用默认提示词。
 func WithCompression(maxTokens, keepRecent int, summaryPrompt string) ConversationOption {
 	return func(c *Conversation) {
@@ -33,20 +30,20 @@ type compressionConfig struct {
 	summaryPrompt string
 }
 
-// estimateTokens 通过字符数 / 4 估算消息列表的 token 数量
+// estimateTokens 通过字节数 / 3 估算消息列表的 token 数量。
 func estimateTokens(msgs []model.Message) int {
 	var n int
 	for _, msg := range msgs {
 		for _, c := range msg.Contents {
-			n += len([]rune(c.TextData)) / 4
+			n += len(c.TextData) / 3
 			if c.ToolCall != nil {
-				n += len([]rune(c.ToolCall.ToolName)) / 4
+				n += len(c.ToolCall.ToolName) / 3
 				if b, err := json.Marshal(c.ToolCall.Arguments); err == nil {
-					n += len([]rune(string(b))) / 4
+					n += len(b) / 3
 				}
 			}
 			if c.ToolResult != nil {
-				n += len([]rune(c.ToolResult.Content)) / 4
+				n += len(c.ToolResult.Content) / 3
 			}
 		}
 	}
@@ -76,9 +73,17 @@ func (c *Conversation) maybeCompress(ctx context.Context, base []model.Message) 
 
 	splitAt := len(convMsgs) - cfg.keepRecent
 
-	// 向前移动切割点，确保对齐到用户消息，避免切断 tool_use/tool_result 配对
+	// 确保 recent 从用户消息开始
 	for splitAt > 0 && convMsgs[splitAt].Role != model.MessageRoleUser {
 		splitAt--
+	}
+	// 确保 old 末尾是 assistant（而非 tool），否则摘要请求末尾会出现两条连续 user 消息
+	// （tool 角色在各 provider 转换后成为 user 消息，随后摘要提示词也是 user 消息）
+	for splitAt > 0 && convMsgs[splitAt-1].Role == model.MessageRoleTool {
+		splitAt--
+		for splitAt > 0 && convMsgs[splitAt].Role != model.MessageRoleUser {
+			splitAt--
+		}
 	}
 
 	if splitAt == 0 {

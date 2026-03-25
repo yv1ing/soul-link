@@ -31,9 +31,9 @@ const (
 type Content struct {
 	Type ContentType `json:"type"`
 
-	TextData   string      `json:"text_data"`
-	ToolCall   *ToolCall   `json:"tool_call"`
-	ToolResult *ToolResult `json:"tool_result"`
+	TextData   string      `json:"text_data,omitempty"`
+	ToolCall   *ToolCall   `json:"tool_call,omitempty"`
+	ToolResult *ToolResult `json:"tool_result,omitempty"`
 }
 
 // 消息封装

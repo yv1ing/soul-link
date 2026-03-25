@@ -2,8 +2,6 @@ package anthropic
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"strings"
 
 	sdk "github.com/anthropics/anthropic-sdk-go"
@@ -22,19 +20,22 @@ type Provider struct {
 	maxTokens int64
 }
 
-// New 创建 Anthropic Provider，baseURL 为空时使用 SDK 默认地址
-func New(apiKey, baseURL, modelName string, opts ...option.RequestOption) *Provider {
+// New 创建 Anthropic Provider。maxTokens <= 0 时使用默认值；baseURL 为空时使用 SDK 默认地址。
+func New(apiKey, baseURL, modelName string, maxTokens int64, opts ...option.RequestOption) *Provider {
 	base := []option.RequestOption{option.WithAPIKey(apiKey)}
 	if baseURL != "" {
 		base = append(base, option.WithBaseURL(baseURL))
 	}
 
-	opts = append(base, opts...)
-	return &Provider{
-		client:    sdk.NewClient(opts...),
+	p := &Provider{
+		client:    sdk.NewClient(append(base, opts...)...),
 		model:     modelName,
 		maxTokens: defaultMaxTokens,
 	}
+	if maxTokens > 0 {
+		p.maxTokens = maxTokens
+	}
+	return p
 }
 
 // Stream 发起流式请求，通过 channel 逐步投递事件，ctx 取消时 goroutine 安全退出
@@ -91,7 +92,7 @@ func (p *Provider) Stream(ctx context.Context, messages []model.Message, tools [
 				if currentToolID == "" {
 					continue
 				}
-				tc, err := parseToolCall(currentToolID, currentToolName, toolBuf.String())
+				tc, err := provider.ParseToolCall(currentToolID, currentToolName, toolBuf.String())
 				currentToolID, currentToolName = "", ""
 				toolBuf.Reset()
 				if err != nil {
@@ -140,7 +141,7 @@ func (p *Provider) Complete(ctx context.Context, messages []model.Message, tools
 
 // buildRequest 将通用消息和工具定义组装为 Messages API 请求参数
 func (p *Provider) buildRequest(messages []model.Message, tools []model.ToolSet) sdk.MessageNewParams {
-	system, msgParams := convertMessages(messages)
+	msgParams, system := convertMessages(messages)
 	req := sdk.MessageNewParams{
 		Model:     p.model,
 		MaxTokens: p.maxTokens,
@@ -155,7 +156,7 @@ func (p *Provider) buildRequest(messages []model.Message, tools []model.ToolSet)
 }
 
 // convertMessages 将通用消息历史转换为 Messages API 输入格式
-func convertMessages(messages []model.Message) (system string, params []sdk.MessageParam) {
+func convertMessages(messages []model.Message) (params []sdk.MessageParam, system string) {
 	for _, msg := range messages {
 		switch msg.Role {
 
@@ -199,7 +200,6 @@ func convertMessages(messages []model.Message) (system string, params []sdk.Mess
 					}
 				}
 			}
-
 			if len(blocks) > 0 {
 				params = append(params, sdk.NewAssistantMessage(blocks...))
 			}
@@ -225,7 +225,7 @@ func convertMessages(messages []model.Message) (system string, params []sdk.Mess
 			}
 		}
 	}
-	return system, params
+	return params, system
 }
 
 // convertTools 将通用工具定义转换为 Messages API tool 参数
@@ -284,7 +284,7 @@ func extractContents(blocks []sdk.ContentBlockUnion) ([]model.Content, error) {
 			})
 		case "tool_use":
 			tu := block.AsToolUse()
-			tc, err := parseToolCall(tu.ID, tu.Name, string(tu.Input))
+			tc, err := provider.ParseToolCall(tu.ID, tu.Name, string(tu.Input))
 			if err != nil {
 				return nil, err
 			}
@@ -292,16 +292,4 @@ func extractContents(blocks []sdk.ContentBlockUnion) ([]model.Content, error) {
 		}
 	}
 	return contents, nil
-}
-
-// parseToolCall 将工具调用的 JSON 字符串参数解析为结构化 ToolCall
-func parseToolCall(id, name, rawJSON string) (*model.ToolCall, error) {
-	if rawJSON == "" {
-		rawJSON = "{}"
-	}
-	var args map[string]any
-	if err := json.Unmarshal([]byte(rawJSON), &args); err != nil {
-		return nil, fmt.Errorf("parse tool %q args: %w", name, err)
-	}
-	return &model.ToolCall{ToolID: id, ToolName: name, Arguments: args}, nil
 }

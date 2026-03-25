@@ -16,6 +16,9 @@ type Conversation struct {
 	compress *compressionConfig
 }
 
+// ConversationOption 用于配置 Conversation
+type ConversationOption func(*Conversation)
+
 // NewConversation 创建新的对话实例
 func NewConversation(p Provider, opts ...ConversationOption) *Conversation {
 	c := &Conversation{provider: p}
@@ -129,6 +132,31 @@ func (c *Conversation) Stream(ctx context.Context, userText string, tools []mode
 			toolCalls []model.Content
 		)
 
+		// commitHistory 将已累积的内容写入对话历史
+		commitHistory := func() {
+			var contents []model.Content
+			if textBuf.Len() > 0 {
+				contents = append(contents, model.Content{
+					Type:     model.ContentTypeTextData,
+					TextData: textBuf.String(),
+				})
+			}
+			contents = append(contents, toolCalls...)
+			c.mu.Lock()
+			if wasCompressed {
+				c.history = compressed
+			}
+			if userMsg != nil {
+				c.history = append(c.history, *userMsg)
+			}
+			c.history = append(c.history, model.Message{
+				Role:     model.MessageRoleAssistant,
+				Contents: contents,
+			})
+			c.mu.Unlock()
+		}
+
+		var committed bool
 		for e := range upstream {
 			switch e.Type {
 			case EventTypeTextDelta:
@@ -139,30 +167,17 @@ func (c *Conversation) Stream(ctx context.Context, userText string, tools []mode
 					ToolCall: e.ToolCall,
 				})
 			case EventTypeDone:
-				var contents []model.Content
-				if textBuf.Len() > 0 {
-					contents = append(contents, model.Content{
-						Type:     model.ContentTypeTextData,
-						TextData: textBuf.String(),
-					})
-				}
-				contents = append(contents, toolCalls...)
-				c.mu.Lock()
-				if wasCompressed {
-					c.history = compressed
-				}
-				if userMsg != nil {
-					c.history = append(c.history, *userMsg)
-				}
-				c.history = append(c.history, model.Message{
-					Role:     model.MessageRoleAssistant,
-					Contents: contents,
-				})
-				c.mu.Unlock()
+				commitHistory()
+				committed = true
 			}
 			if !send(e) {
 				return
 			}
+		}
+
+		// 流异常结束（未收到 Done）：若已有部分内容则提交，保持历史与用户所见一致
+		if !committed && (textBuf.Len() > 0 || len(toolCalls) > 0) {
+			commitHistory()
 		}
 	}()
 

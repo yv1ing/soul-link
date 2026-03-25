@@ -9,6 +9,7 @@ import (
 	"soul-link/internal/provider"
 	"soul-link/internal/provider/anthropic"
 	"soul-link/internal/provider/openai"
+	"soul-link/internal/registry"
 )
 
 const (
@@ -22,19 +23,21 @@ const (
 
 // ── 工具定义 ──────────────────────────────────────────────────────────────────
 
-var weatherTool = model.ToolSet{
-	ToolName:    "get_weather",
-	Description: "获取指定城市的当前天气",
-	Parameters: map[string]any{
-		"type": "object",
-		"properties": map[string]any{
-			"city": map[string]any{
-				"type":        "string",
-				"description": "城市名称",
-			},
-		},
-		"required": []any{"city"},
-	},
+type getWeatherArgs struct {
+	City string `json:"city" desc:"城市名称" required:"true"`
+}
+
+func getWeather(args getWeatherArgs) (string, error) {
+	return `{"temperature":"25°C","condition":"晴"}`, nil
+}
+
+func newWeatherRegistry(t *testing.T) *registry.Registry {
+	t.Helper()
+	r := registry.New()
+	if err := r.Register("get_weather", "获取指定城市的当前天气", getWeather); err != nil {
+		t.Fatal(err)
+	}
+	return r
 }
 
 // ── 辅助函数 ──────────────────────────────────────────────────────────────────
@@ -52,10 +55,9 @@ func newAnthropic(t *testing.T) provider.Provider {
 	if anthropicKey == "" {
 		t.Skip("anthropicKey not set")
 	}
-	return anthropic.New(anthropicKey, anthropicBase, anthropicModel)
+	return anthropic.New(anthropicKey, anthropicBase, anthropicModel, 0)
 }
 
-// eachProvider 对每个已配置的 provider 运行子测试
 func eachProvider(t *testing.T, f func(t *testing.T, p provider.Provider)) {
 	t.Helper()
 	for _, tc := range []struct {
@@ -69,7 +71,6 @@ func eachProvider(t *testing.T, f func(t *testing.T, p provider.Provider)) {
 	}
 }
 
-// findToolCall 从内容列表中返回第一个工具调用，未找到则 Fatal
 func findToolCall(t *testing.T, contents []model.Content) *model.ToolCall {
 	t.Helper()
 	for _, c := range contents {
@@ -81,7 +82,6 @@ func findToolCall(t *testing.T, contents []model.Content) *model.ToolCall {
 	return nil
 }
 
-// drainStream 消费流式 channel，返回收到的工具调用（若有），遇错误则 Fatal
 func drainStream(t *testing.T, ch <-chan provider.Event) *model.ToolCall {
 	t.Helper()
 	var tc *model.ToolCall
@@ -155,23 +155,21 @@ func TestConversation_Stream_MultiTurn(t *testing.T) {
 
 func TestConversation_Complete_ToolCall(t *testing.T) {
 	eachProvider(t, func(t *testing.T, p provider.Provider) {
+		r := newWeatherRegistry(t)
 		conv := provider.NewConversation(p)
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
 
-		contents, _, err := conv.Complete(ctx, "北京现在天气怎么样？", []model.ToolSet{weatherTool})
+		contents, _, err := conv.Complete(ctx, "北京现在天气怎么样？", r.ToolSets())
 		if err != nil {
 			t.Fatalf("round 1: %v", err)
 		}
 		tc := findToolCall(t, contents)
 		t.Logf("tool call: %s %v", tc.ToolName, tc.Arguments)
 
-		conv.InjectToolResults(model.ToolResult{
-			CallID:  tc.ToolID,
-			Content: `{"temperature":"25°C","condition":"晴"}`,
-		})
+		conv.InjectToolResults(r.Execute(*tc))
 
-		contents, _, err = conv.Complete(ctx, "", []model.ToolSet{weatherTool})
+		contents, _, err = conv.Complete(ctx, "", r.ToolSets())
 		if err != nil {
 			t.Fatalf("round 2: %v", err)
 		}
@@ -183,11 +181,12 @@ func TestConversation_Complete_ToolCall(t *testing.T) {
 
 func TestConversation_Stream_ToolCall(t *testing.T) {
 	eachProvider(t, func(t *testing.T, p provider.Provider) {
+		r := newWeatherRegistry(t)
 		conv := provider.NewConversation(p)
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
 
-		ch, err := conv.Stream(ctx, "北京现在天气怎么样？", []model.ToolSet{weatherTool})
+		ch, err := conv.Stream(ctx, "北京现在天气怎么样？", r.ToolSets())
 		if err != nil {
 			t.Fatalf("round 1: %v", err)
 		}
@@ -196,12 +195,9 @@ func TestConversation_Stream_ToolCall(t *testing.T) {
 			t.Fatal("expected tool_call event")
 		}
 
-		conv.InjectToolResults(model.ToolResult{
-			CallID:  tc.ToolID,
-			Content: `{"temperature":"25°C","condition":"晴"}`,
-		})
+		conv.InjectToolResults(r.Execute(*tc))
 
-		ch, err = conv.Stream(ctx, "", []model.ToolSet{weatherTool})
+		ch, err = conv.Stream(ctx, "", r.ToolSets())
 		if err != nil {
 			t.Fatalf("round 2: %v", err)
 		}
