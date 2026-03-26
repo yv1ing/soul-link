@@ -42,7 +42,7 @@ func New(apiKey, baseURL, modelName string, maxTokens int64, thinking *model.Thi
 }
 
 // Stream 发起流式请求，通过 channel 逐步投递事件
-func (p *Provider) Stream(ctx context.Context, messages []model.Message, tools []model.ToolSet) (<-chan provider.Event, error) {
+func (p *Provider) Stream(ctx context.Context, messages []model.Message, tools []model.ToolDef) (<-chan provider.Event, error) {
 	stream := p.client.Messages.NewStreaming(ctx, p.buildRequest(messages, tools))
 
 	ch := make(chan provider.Event, 16)
@@ -156,7 +156,7 @@ func (p *Provider) Stream(ctx context.Context, messages []model.Message, tools [
 }
 
 // Complete 发起非流式请求，返回完整内容列表和用量统计
-func (p *Provider) Complete(ctx context.Context, messages []model.Message, tools []model.ToolSet) ([]model.Content, *model.Usage, error) {
+func (p *Provider) Complete(ctx context.Context, messages []model.Message, tools []model.ToolDef) ([]model.Content, *model.Usage, error) {
 	msg, err := p.client.Messages.New(ctx, p.buildRequest(messages, tools))
 	if err != nil {
 		return nil, nil, err
@@ -172,7 +172,7 @@ func (p *Provider) Complete(ctx context.Context, messages []model.Message, tools
 }
 
 // buildRequest 将通用消息和工具定义组装为 Messages API 请求参数
-func (p *Provider) buildRequest(messages []model.Message, tools []model.ToolSet) sdk.MessageNewParams {
+func (p *Provider) buildRequest(messages []model.Message, tools []model.ToolDef) sdk.MessageNewParams {
 	msgParams, system := convertMessages(messages)
 	req := sdk.MessageNewParams{
 		Model:     p.model,
@@ -182,7 +182,7 @@ func (p *Provider) buildRequest(messages []model.Message, tools []model.ToolSet)
 	}
 
 	if system != "" {
-		req.System = []sdk.TextBlockParam{{Text: system}}
+		req.System = []sdk.TextBlockParam{{Text: string(system)}}
 	}
 	if p.thinking != nil && p.thinking.BudgetTokens > 0 {
 		req.Thinking = sdk.ThinkingConfigParamOfEnabled(p.thinking.BudgetTokens)
@@ -192,7 +192,20 @@ func (p *Provider) buildRequest(messages []model.Message, tools []model.ToolSet)
 }
 
 // convertMessages 将通用消息历史转换为 Messages API 输入格式
-func convertMessages(messages []model.Message) (params []sdk.MessageParam, system string) {
+func convertMessages(messages []model.Message) (params []sdk.MessageParam, system model.TextData) {
+	// appendMsg 追加消息，自动合并连续同角色消息，
+	// 确保输出始终满足 Anthropic API 的 user/assistant 严格交替要求
+	appendMsg := func(role sdk.MessageParamRole, blocks []sdk.ContentBlockParamUnion) {
+		if len(blocks) == 0 {
+			return
+		}
+		if n := len(params); n > 0 && params[n-1].Role == role {
+			params[n-1].Content = append(params[n-1].Content, blocks...)
+		} else {
+			params = append(params, sdk.MessageParam{Role: role, Content: blocks})
+		}
+	}
+
 	for _, msg := range messages {
 		switch msg.Role {
 
@@ -209,13 +222,23 @@ func convertMessages(messages []model.Message) (params []sdk.MessageParam, syste
 		case model.MessageRoleUser:
 			var blocks []sdk.ContentBlockParamUnion
 			for _, c := range msg.Contents {
-				if c.Type == model.ContentTypeText {
-					blocks = append(blocks, sdk.NewTextBlock(c.Text))
+				switch c.Type {
+				case model.ContentTypeText:
+					blocks = append(blocks, sdk.NewTextBlock(string(c.Text)))
+				case model.ContentTypeImageURL:
+					if c.Image != "" {
+						blocks = append(blocks, sdk.NewImageBlock(sdk.URLImageSourceParam{URL: string(c.Image)}))
+					}
+				case model.ContentTypeImageRaw:
+					if c.Image != "" {
+						blocks = append(blocks, sdk.NewImageBlock(sdk.Base64ImageSourceParam{
+							MediaType: sdk.Base64ImageSourceMediaType(c.MediaType),
+							Data:      string(c.Image),
+						}))
+					}
 				}
 			}
-			if len(blocks) > 0 {
-				params = append(params, sdk.NewUserMessage(blocks...))
-			}
+			appendMsg(sdk.MessageParamRoleUser, blocks)
 
 		case model.MessageRoleAssistant:
 			var blocks []sdk.ContentBlockParamUnion
@@ -230,7 +253,7 @@ func convertMessages(messages []model.Message) (params []sdk.MessageParam, syste
 						}
 					}
 				case model.ContentTypeText:
-					blocks = append(blocks, sdk.NewTextBlock(c.Text))
+					blocks = append(blocks, sdk.NewTextBlock(string(c.Text)))
 				case model.ContentTypeToolCall:
 					if c.ToolCall != nil {
 						tc := c.ToolCall
@@ -238,10 +261,7 @@ func convertMessages(messages []model.Message) (params []sdk.MessageParam, syste
 					}
 				}
 			}
-
-			if len(blocks) > 0 {
-				params = append(params, sdk.NewAssistantMessage(blocks...))
-			}
+			appendMsg(sdk.MessageParamRoleAssistant, blocks)
 
 		case model.MessageRoleTool:
 			var blocks []sdk.ContentBlockParamUnion
@@ -251,17 +271,7 @@ func convertMessages(messages []model.Message) (params []sdk.MessageParam, syste
 					blocks = append(blocks, sdk.NewToolResultBlock(tr.CallID, tr.Content, tr.IsError))
 				}
 			}
-
-			if len(blocks) == 0 {
-				continue
-			}
-
-			n := len(params)
-			if n > 0 && params[n-1].Role == sdk.MessageParamRoleUser {
-				params[n-1].Content = append(params[n-1].Content, blocks...)
-			} else {
-				params = append(params, sdk.NewUserMessage(blocks...))
-			}
+			appendMsg(sdk.MessageParamRoleUser, blocks)
 		}
 	}
 
@@ -269,7 +279,7 @@ func convertMessages(messages []model.Message) (params []sdk.MessageParam, syste
 }
 
 // convertTools 将通用工具定义转换为 Messages API tool 参数
-func convertTools(tools []model.ToolSet) []sdk.ToolUnionParam {
+func convertTools(tools []model.ToolDef) []sdk.ToolUnionParam {
 	if len(tools) == 0 {
 		return nil
 	}
@@ -334,7 +344,7 @@ func extractContents(blocks []sdk.ContentBlockUnion) ([]model.Content, error) {
 		case "text":
 			contents = append(contents, model.Content{
 				Type: model.ContentTypeText,
-				Text: block.AsText().Text,
+				Text: model.TextData(block.AsText().Text),
 			})
 		case "tool_use":
 			tu := block.AsToolUse()

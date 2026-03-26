@@ -9,10 +9,10 @@ import (
 	"soul-link/internal/model"
 )
 
-const defaultSummaryPrompt = "请将以下对话历史简洁地总结为一段摘要，保留关键信息和结论。使用与对话相同的语言。"
+const defaultSummaryPrompt = "Summarize the conversation history above into a concise summary, preserving key information and conclusions. Respond in the same language as the conversation."
 
 // WithCompression 启用历史摘要压缩
-func WithCompression(maxTokens, keepRecent int, summaryPrompt string) ConversationOption {
+func WithCompression(maxTokens, keepRecent int, summaryPrompt model.TextData) ConversationOption {
 	return func(c *Conversation) {
 		if summaryPrompt == "" {
 			summaryPrompt = defaultSummaryPrompt
@@ -28,20 +28,18 @@ func WithCompression(maxTokens, keepRecent int, summaryPrompt string) Conversati
 type compressionConfig struct {
 	maxTokens     int
 	keepRecent    int
-	summaryPrompt string
+	summaryPrompt model.TextData
 }
 
-// estimateTokens 估算消息列表的 token 数量。
-// 文本使用 rune 计数（对中日韩文字准确，对 ASCII 略高估但更安全），
-// JSON 结构体使用字节数 / 4（ASCII 主导，4 chars ≈ 1 token）。
+// estimateTokens 估算消息列表的 token 数量（以 rune 数为统一基准）
 func estimateTokens(msgs []model.Message) int {
 	var n int
 	for _, msg := range msgs {
 		for _, c := range msg.Contents {
-			n += utf8.RuneCountInString(c.Text)
+			n += utf8.RuneCountInString(string(c.Text))
 			if c.ToolCall != nil {
 				if b, err := json.Marshal(c.ToolCall.Arguments); err == nil {
-					n += len(b) / 4
+					n += utf8.RuneCountInString(string(b))
 				}
 			}
 			if c.ToolResult != nil {
@@ -78,7 +76,6 @@ func (c *Conversation) maybeCompress(ctx context.Context, base []model.Message) 
 
 	splitAt := len(convMsgs) - cfg.keepRecent
 
-	// 确保 recent 从用户消息开始
 	for splitAt > 0 && convMsgs[splitAt].Role != model.MessageRoleUser {
 		splitAt--
 	}
@@ -88,6 +85,10 @@ func (c *Conversation) maybeCompress(ctx context.Context, base []model.Message) 
 		for splitAt > 0 && convMsgs[splitAt].Role != model.MessageRoleUser {
 			splitAt--
 		}
+	}
+
+	for splitAt > 0 && convMsgs[splitAt].Role != model.MessageRoleUser {
+		splitAt--
 	}
 
 	if splitAt == 0 {
@@ -109,7 +110,7 @@ func (c *Conversation) maybeCompress(ctx context.Context, base []model.Message) 
 		return nil, false, fmt.Errorf("compress history: %w", err)
 	}
 
-	var summaryText string
+	var summaryText model.TextData
 	for _, ct := range contents {
 		if ct.Type == model.ContentTypeText && ct.Text != "" {
 			summaryText = ct.Text
@@ -120,14 +121,19 @@ func (c *Conversation) maybeCompress(ctx context.Context, base []model.Message) 
 		return base, false, nil
 	}
 
-	summaryMsg := model.Message{
-		Role:     model.MessageRoleSystem,
-		Contents: []model.Content{{Type: model.ContentTypeText, Text: "对话摘要：\n" + summaryText}},
+	summaryUser := model.Message{
+		Role:     model.MessageRoleUser,
+		Contents: []model.Content{{Type: model.ContentTypeText, Text: "Summary of previous conversation: "}},
 	}
 
-	compressed := make([]model.Message, 0, len(sysMsgs)+1+len(recent))
+	summaryAssistant := model.Message{
+		Role:     model.MessageRoleAssistant,
+		Contents: []model.Content{{Type: model.ContentTypeText, Text: summaryText}},
+	}
+
+	compressed := make([]model.Message, 0, len(sysMsgs)+2+len(recent))
 	compressed = append(compressed, sysMsgs...)
-	compressed = append(compressed, summaryMsg)
+	compressed = append(compressed, summaryUser, summaryAssistant)
 	compressed = append(compressed, recent...)
 
 	return compressed, true, nil

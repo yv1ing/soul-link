@@ -1,7 +1,7 @@
 package model
 
-// ToolSet 描述单个函数工具的定义
-type ToolSet struct {
+// ToolDef 描述单个函数工具的定义
+type ToolDef struct {
 	Name        string         `json:"name"`
 	Description string         `json:"description"`
 	Parameters  map[string]any `json:"parameters"`

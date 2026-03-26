@@ -10,7 +10,7 @@ import (
 )
 
 type funcTool struct {
-	set     model.ToolSet
+	def     model.ToolDef
 	handler func(map[string]any) (string, error)
 }
 
@@ -41,7 +41,7 @@ func newFuncTool(name, description string, fn any) (*funcTool, error) {
 
 	fnVal := reflect.ValueOf(fn)
 	return &funcTool{
-		set: model.ToolSet{
+		def: model.ToolDef{
 			Name:        name,
 			Description: description,
 			Parameters:  params,

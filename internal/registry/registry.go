@@ -8,7 +8,7 @@ import (
 
 type Registry struct {
 	tools map[string]*funcTool
-	names []string // 保持注册顺序，使 ToolSets 输出稳定
+	names []string // 保持注册顺序，使 ToolDefs 输出稳定
 }
 
 func New() *Registry {
@@ -27,12 +27,12 @@ func (r *Registry) Register(name, description string, fn any) error {
 	return nil
 }
 
-func (r *Registry) ToolSets() []model.ToolSet {
-	sets := make([]model.ToolSet, 0, len(r.names))
+func (r *Registry) ToolDefs() []model.ToolDef {
+	defs := make([]model.ToolDef, 0, len(r.names))
 	for _, name := range r.names {
-		sets = append(sets, r.tools[name].set)
+		defs = append(defs, r.tools[name].def)
 	}
-	return sets
+	return defs
 }
 
 func (r *Registry) Execute(call model.ToolCall) model.ToolResult {

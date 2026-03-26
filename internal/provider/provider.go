@@ -30,8 +30,8 @@ type Event struct {
 
 // Provider 定义统一的 LLM 调用接口
 type Provider interface {
-	Stream(ctx context.Context, messages []model.Message, tools []model.ToolSet) (<-chan Event, error)
-	Complete(ctx context.Context, messages []model.Message, tools []model.ToolSet) ([]model.Content, *model.Usage, error)
+	Stream(ctx context.Context, messages []model.Message, tools []model.ToolDef) (<-chan Event, error)
+	Complete(ctx context.Context, messages []model.Message, tools []model.ToolDef) ([]model.Content, *model.Usage, error)
 }
 
 // ParseToolCall 将工具调用的 JSON 字符串参数解析为结构化 ToolCall，供各 Provider 实现共用

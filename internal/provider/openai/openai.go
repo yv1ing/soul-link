@@ -38,7 +38,7 @@ func New(apiKey, baseURL, modelName string, thinking *model.ThinkingConfig, opts
 }
 
 // Stream 发起流式请求，通过 channel 逐步投递事件
-func (p *Provider) Stream(ctx context.Context, messages []model.Message, tools []model.ToolSet) (<-chan provider.Event, error) {
+func (p *Provider) Stream(ctx context.Context, messages []model.Message, tools []model.ToolDef) (<-chan provider.Event, error) {
 	req, err := p.buildRequest(messages, tools)
 	if err != nil {
 		return nil, err
@@ -120,7 +120,7 @@ func (p *Provider) Stream(ctx context.Context, messages []model.Message, tools [
 }
 
 // Complete 发起非流式请求，返回完整内容列表和用量统计
-func (p *Provider) Complete(ctx context.Context, messages []model.Message, tools []model.ToolSet) ([]model.Content, *model.Usage, error) {
+func (p *Provider) Complete(ctx context.Context, messages []model.Message, tools []model.ToolDef) ([]model.Content, *model.Usage, error) {
 	req, err := p.buildRequest(messages, tools)
 	if err != nil {
 		return nil, nil, err
@@ -141,7 +141,7 @@ func (p *Provider) Complete(ctx context.Context, messages []model.Message, tools
 }
 
 // buildRequest 将通用消息和工具定义组装为 Responses API 请求参数
-func (p *Provider) buildRequest(messages []model.Message, tools []model.ToolSet) (responses.ResponseNewParams, error) {
+func (p *Provider) buildRequest(messages []model.Message, tools []model.ToolDef) (responses.ResponseNewParams, error) {
 	input, instructions, err := convertMessages(messages)
 	if err != nil {
 		return responses.ResponseNewParams{}, err
@@ -154,7 +154,7 @@ func (p *Provider) buildRequest(messages []model.Message, tools []model.ToolSet)
 	}
 
 	if instructions != "" {
-		req.Instructions = sdk.String(instructions)
+		req.Instructions = sdk.String(string(instructions))
 	}
 
 	if p.thinking != nil && p.thinking.Effort != "" {
@@ -168,9 +168,9 @@ func (p *Provider) buildRequest(messages []model.Message, tools []model.ToolSet)
 }
 
 // convertMessages 将通用消息历史转换为 Responses API 输入格式
-func convertMessages(messages []model.Message) (responses.ResponseInputParam, string, error) {
+func convertMessages(messages []model.Message) (responses.ResponseInputParam, model.TextData, error) {
 	var (
-		instructions string
+		instructions model.TextData
 		items        []responses.ResponseInputItemUnionParam
 	)
 
@@ -188,27 +188,42 @@ func convertMessages(messages []model.Message) (responses.ResponseInputParam, st
 			}
 
 		case model.MessageRoleUser:
-			var text string
+			var parts responses.ResponseInputMessageContentListParam
 			for _, c := range msg.Contents {
-				if c.Type == model.ContentTypeText {
-					if text != "" {
-						text += "\n"
+				switch c.Type {
+				case model.ContentTypeText:
+					parts = append(parts, responses.ResponseInputContentParamOfInputText(string(c.Text)))
+				case model.ContentTypeImageURL:
+					if c.Image != "" {
+						parts = append(parts, responses.ResponseInputContentUnionParam{
+							OfInputImage: &responses.ResponseInputImageParam{
+								ImageURL: param.NewOpt(string(c.Image)),
+							},
+						})
 					}
-					text += c.Text
+				case model.ContentTypeImageRaw:
+					if c.Image != "" {
+						dataURI := "data:" + c.MediaType + ";base64," + string(c.Image)
+						parts = append(parts, responses.ResponseInputContentUnionParam{
+							OfInputImage: &responses.ResponseInputImageParam{
+								ImageURL: param.NewOpt(dataURI),
+							},
+						})
+					}
 				}
 			}
-			if text != "" {
-				items = append(items, responses.ResponseInputItemParamOfMessage(text, responses.EasyInputMessageRoleUser))
+			if len(parts) > 0 {
+				items = append(items, responses.ResponseInputItemParamOfMessage(parts, responses.EasyInputMessageRoleUser))
 			}
 
 		case model.MessageRoleAssistant:
-			var pendingText string
+			var pendingText model.TextData
 			for _, c := range msg.Contents {
 				switch c.Type {
 				case model.ContentTypeThinking:
 					if c.Thinking != nil && c.Thinking.ID != "" {
 						if pendingText != "" {
-							items = append(items, responses.ResponseInputItemParamOfMessage(pendingText, responses.EasyInputMessageRoleAssistant))
+							items = append(items, responses.ResponseInputItemParamOfMessage(string(pendingText), responses.EasyInputMessageRoleAssistant))
 							pendingText = ""
 						}
 						items = append(items, responses.ResponseInputItemParamOfReasoning(c.Thinking.ID, splitSummaries(c.Thinking.Text)))
@@ -223,7 +238,7 @@ func convertMessages(messages []model.Message) (responses.ResponseInputParam, st
 						continue
 					}
 					if pendingText != "" {
-						items = append(items, responses.ResponseInputItemParamOfMessage(pendingText, responses.EasyInputMessageRoleAssistant))
+						items = append(items, responses.ResponseInputItemParamOfMessage(string(pendingText), responses.EasyInputMessageRoleAssistant))
 						pendingText = ""
 					}
 					tc := c.ToolCall
@@ -242,7 +257,7 @@ func convertMessages(messages []model.Message) (responses.ResponseInputParam, st
 			}
 
 			if pendingText != "" {
-				items = append(items, responses.ResponseInputItemParamOfMessage(pendingText, responses.EasyInputMessageRoleAssistant))
+				items = append(items, responses.ResponseInputItemParamOfMessage(string(pendingText), responses.EasyInputMessageRoleAssistant))
 			}
 
 		case model.MessageRoleTool:
@@ -259,7 +274,7 @@ func convertMessages(messages []model.Message) (responses.ResponseInputParam, st
 }
 
 // convertTools 将通用工具定义转换为 Responses API function tool 参数
-func convertTools(tools []model.ToolSet) []responses.ToolUnionParam {
+func convertTools(tools []model.ToolDef) []responses.ToolUnionParam {
 	if len(tools) == 0 {
 		return nil
 	}
@@ -304,7 +319,7 @@ func extractContents(items []responses.ResponseOutputItemUnion) ([]model.Content
 				if part.Type == "output_text" {
 					contents = append(contents, model.Content{
 						Type: model.ContentTypeText,
-						Text: part.AsOutputText().Text,
+						Text: model.TextData(part.AsOutputText().Text),
 					})
 				}
 			}

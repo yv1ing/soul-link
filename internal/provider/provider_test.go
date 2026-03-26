@@ -112,14 +112,21 @@ func newWeatherRegistry(t *testing.T) *registry.Registry {
 
 // ── 测试：多轮对话 ──────────────────────────────────────────────────────────────
 
+const testImageURL = ""
+const testImageBase64 = ""
+
 func TestConversation_Complete_MultiTurn(t *testing.T) {
 	eachProvider(t, func(t *testing.T, p provider.Provider) {
 		conv := provider.NewConversation(p)
-		conv.AddSystem("你是一个简洁的助手，每次回复不超过两句话。")
+		conv.AddSystem("你是一个简洁的助手，用中文回复，每次不超过两句话。")
 		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 		defer cancel()
 
-		contents, _, err := conv.Complete(ctx, "我叫小明。", nil)
+		// round 1: 图片URL输入
+		contents, _, err := conv.Complete(ctx, provider.UserContent(
+			[]model.TextData{"请简单描述这张图片。"},
+			[]provider.ImageInput{{URL: model.ImageData(testImageURL)}},
+		), nil)
 		if err != nil {
 			t.Fatalf("round 1: %v", err)
 		}
@@ -130,7 +137,11 @@ func TestConversation_Complete_MultiTurn(t *testing.T) {
 			t.Logf("round 1: %s", c.Text)
 		}
 
-		contents, _, err = conv.Complete(ctx, "我叫什么名字？", nil)
+		// round 2: base64图片输入
+		contents, _, err = conv.Complete(ctx, provider.UserContent(
+			[]model.TextData{"这张新图片呢？"},
+			[]provider.ImageInput{{Base64: model.ImageData(testImageBase64), MediaType: "image/png"}},
+		), nil)
 		if err != nil {
 			t.Fatalf("round 2: %v", err)
 		}
@@ -140,25 +151,52 @@ func TestConversation_Complete_MultiTurn(t *testing.T) {
 		if c := findContent(contents, model.ContentTypeText); c != nil {
 			t.Logf("round 2: %s", c.Text)
 		}
+
+		// round 3: 纯文本追问
+		contents, _, err = conv.Complete(ctx, provider.TextContent("前面两张图片有什么不同？"), nil)
+		if err != nil {
+			t.Fatalf("round 3: %v", err)
+		}
+		if c := findContent(contents, model.ContentTypeThinking); c != nil {
+			t.Logf("round 3 [thinking] redacted=%v text=%q", c.Thinking.Redacted, c.Thinking.Text)
+		}
+		if c := findContent(contents, model.ContentTypeText); c != nil {
+			t.Logf("round 3: %s", c.Text)
+		}
 	})
 }
 
 func TestConversation_Stream_MultiTurn(t *testing.T) {
 	eachProvider(t, func(t *testing.T, p provider.Provider) {
 		conv := provider.NewConversation(p)
-		conv.AddSystem("你是一个简洁的助手，每次回复不超过两句话。")
+		conv.AddSystem("你是一个简洁的助手，用中文回复，每次不超过两句话。")
 		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 		defer cancel()
 
-		ch, err := conv.Stream(ctx, "我叫小明。", nil)
+		// round 1: 图片URL输入
+		ch, err := conv.Stream(ctx, provider.UserContent(
+			[]model.TextData{"请简单描述这张图片。"},
+			[]provider.ImageInput{{URL: model.ImageData(testImageURL)}},
+		), nil)
 		if err != nil {
 			t.Fatalf("round 1: %v", err)
 		}
 		drainStream(t, ch)
 
-		ch, err = conv.Stream(ctx, "我叫什么名字？", nil)
+		// round 2: base64图片输入
+		ch, err = conv.Stream(ctx, provider.UserContent(
+			[]model.TextData{"这张新图片呢？"},
+			[]provider.ImageInput{{Base64: model.ImageData(testImageBase64), MediaType: "image/png"}},
+		), nil)
 		if err != nil {
 			t.Fatalf("round 2: %v", err)
+		}
+		drainStream(t, ch)
+
+		// round 3: 纯文本追问
+		ch, err = conv.Stream(ctx, provider.TextContent("前面两张图片有什么不同？"), nil)
+		if err != nil {
+			t.Fatalf("round 3: %v", err)
 		}
 		drainStream(t, ch)
 	})
@@ -173,7 +211,7 @@ func TestConversation_Complete_ToolCall(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 		defer cancel()
 
-		contents, _, err := conv.Complete(ctx, "北京现在天气怎么样？", r.ToolSets())
+		contents, _, err := conv.Complete(ctx, provider.TextContent("北京现在天气怎么样？"), r.ToolDefs())
 		if err != nil {
 			t.Fatalf("complete: %v", err)
 		}
@@ -195,7 +233,7 @@ func TestConversation_Stream_ToolCall(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 		defer cancel()
 
-		ch, err := conv.Stream(ctx, "北京现在天气怎么样？", r.ToolSets())
+		ch, err := conv.Stream(ctx, provider.TextContent("北京现在天气怎么样？"), r.ToolDefs())
 		if err != nil {
 			t.Fatalf("stream: %v", err)
 		}
