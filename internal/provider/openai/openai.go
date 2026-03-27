@@ -18,23 +18,33 @@ import (
 
 // Provider 封装 OpenAI Responses API 客户端
 type Provider struct {
-	client   sdk.Client
-	model    string
-	thinking *model.ThinkingConfig
+	client     sdk.Client
+	model      string
+	thinking   *model.ThinkingConfig
+	maxTokens  int64
+	toolChoice string
+	reqOpts    []option.RequestOption
 }
 
+type Option func(*Provider)
+
+func WithMaxTokens(n int64) Option                           { return func(p *Provider) { p.maxTokens = n } }
+func WithToolChoice(choice string) Option                    { return func(p *Provider) { p.toolChoice = choice } }
+func WithRequestOptions(opts ...option.RequestOption) Option { return func(p *Provider) { p.reqOpts = append(p.reqOpts, opts...) } }
+
 // New 创建 OpenAI Provider
-func New(apiKey, baseURL, modelName string, thinking *model.ThinkingConfig, opts ...option.RequestOption) *Provider {
-	base := []option.RequestOption{option.WithAPIKey(apiKey)}
-	if baseURL != "" {
-		base = append(base, option.WithBaseURL(baseURL))
+func New(apiKey, baseURL, modelName string, thinking *model.ThinkingConfig, opts ...Option) *Provider {
+	p := &Provider{model: modelName, thinking: thinking}
+	for _, opt := range opts {
+		opt(p)
 	}
 
-	return &Provider{
-		client:   sdk.NewClient(append(base, opts...)...),
-		model:    modelName,
-		thinking: thinking,
+	reqOpts := []option.RequestOption{option.WithAPIKey(apiKey)}
+	if baseURL != "" {
+		reqOpts = append(reqOpts, option.WithBaseURL(baseURL))
 	}
+	p.client = sdk.NewClient(append(reqOpts, p.reqOpts...)...)
+	return p
 }
 
 // Stream 发起流式请求，通过 channel 逐步投递事件
@@ -57,6 +67,8 @@ func (p *Provider) Stream(ctx context.Context, messages []model.Message, tools [
 				return false
 			}
 		}
+
+		var usage *model.Usage
 
 		for stream.Next() {
 			event := stream.Current()
@@ -101,18 +113,14 @@ func (p *Provider) Stream(ctx context.Context, messages []model.Message, tools [
 
 			case "response.completed":
 				u := event.AsResponseCompleted().Response.Usage
-				if !send(provider.Event{
-					Type:  provider.EventTypeDone,
-					Usage: &model.Usage{InputTokens: int(u.InputTokens), OutputTokens: int(u.OutputTokens)},
-				}) {
-					return
-				}
-				return
+				usage = &model.Usage{InputTokens: int(u.InputTokens), OutputTokens: int(u.OutputTokens)}
 			}
 		}
 
 		if err := stream.Err(); err != nil {
 			send(provider.Event{Type: provider.EventTypeError, Err: err})
+		} else {
+			send(provider.Event{Type: provider.EventTypeDone, Usage: usage})
 		}
 	}()
 
@@ -161,6 +169,21 @@ func (p *Provider) buildRequest(messages []model.Message, tools []model.ToolDef)
 		req.Reasoning = shared.ReasoningParam{
 			Effort:  shared.ReasoningEffort(p.thinking.Effort),
 			Summary: shared.ReasoningSummaryConcise,
+		}
+	}
+	if p.maxTokens > 0 {
+		req.MaxOutputTokens = param.NewOpt(p.maxTokens)
+	}
+	if p.toolChoice != "" {
+		switch p.toolChoice {
+		case "auto", "none", "required":
+			req.ToolChoice = responses.ResponseNewParamsToolChoiceUnion{
+				OfToolChoiceMode: param.NewOpt(responses.ToolChoiceOptions(p.toolChoice)),
+			}
+		default:
+			req.ToolChoice = responses.ResponseNewParamsToolChoiceUnion{
+				OfFunctionTool: &responses.ToolChoiceFunctionParam{Name: p.toolChoice},
+			}
 		}
 	}
 

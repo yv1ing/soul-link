@@ -15,29 +15,32 @@ const defaultMaxTokens = int64(4096)
 
 // Provider 封装 Anthropic Messages API 客户端
 type Provider struct {
-	client    sdk.Client
-	model     string
-	maxTokens int64
-	thinking  *model.ThinkingConfig
+	client     sdk.Client
+	model      string
+	thinking   *model.ThinkingConfig
+	maxTokens  int64
+	toolChoice string
+	reqOpts    []option.RequestOption
 }
 
+type Option func(*Provider)
+
+func WithMaxTokens(n int64) Option                           { return func(p *Provider) { p.maxTokens = n } }
+func WithToolChoice(choice string) Option                    { return func(p *Provider) { p.toolChoice = choice } }
+func WithRequestOptions(opts ...option.RequestOption) Option { return func(p *Provider) { p.reqOpts = append(p.reqOpts, opts...) } }
+
 // New 创建 Anthropic Provider
-func New(apiKey, baseURL, modelName string, maxTokens int64, thinking *model.ThinkingConfig, opts ...option.RequestOption) *Provider {
-	base := []option.RequestOption{option.WithAPIKey(apiKey)}
+func New(apiKey, baseURL, modelName string, thinking *model.ThinkingConfig, opts ...Option) *Provider {
+	p := &Provider{model: modelName, thinking: thinking, maxTokens: defaultMaxTokens}
+	for _, opt := range opts {
+		opt(p)
+	}
+
+	reqOpts := []option.RequestOption{option.WithAPIKey(apiKey)}
 	if baseURL != "" {
-		base = append(base, option.WithBaseURL(baseURL))
+		reqOpts = append(reqOpts, option.WithBaseURL(baseURL))
 	}
-
-	p := &Provider{
-		client:    sdk.NewClient(append(base, opts...)...),
-		model:     modelName,
-		maxTokens: defaultMaxTokens,
-		thinking:  thinking,
-	}
-
-	if maxTokens > 0 {
-		p.maxTokens = maxTokens
-	}
+	p.client = sdk.NewClient(append(reqOpts, p.reqOpts...)...)
 	return p
 }
 
@@ -66,7 +69,7 @@ func (p *Provider) Stream(ctx context.Context, messages []model.Message, tools [
 			currentToolName  string
 			currentBlockType string
 			redactedData     string
-			inputTokens      int
+			usage            *model.Usage
 		)
 
 		for stream.Next() {
@@ -74,7 +77,7 @@ func (p *Provider) Stream(ctx context.Context, messages []model.Message, tools [
 			switch event.Type {
 
 			case "message_start":
-				inputTokens = int(event.AsMessageStart().Message.Usage.InputTokens)
+				usage = &model.Usage{InputTokens: int(event.AsMessageStart().Message.Usage.InputTokens)}
 
 			case "content_block_start":
 				cb := event.AsContentBlockStart().ContentBlock
@@ -138,17 +141,17 @@ func (p *Provider) Stream(ctx context.Context, messages []model.Message, tools [
 
 			case "message_delta":
 				u := event.AsMessageDelta().Usage
-				if !send(provider.Event{
-					Type:  provider.EventTypeDone,
-					Usage: &model.Usage{InputTokens: inputTokens, OutputTokens: int(u.OutputTokens)},
-				}) {
-					return
+				if usage == nil {
+					usage = &model.Usage{}
 				}
+				usage.OutputTokens = int(u.OutputTokens)
 			}
 		}
 
 		if err := stream.Err(); err != nil {
 			send(provider.Event{Type: provider.EventTypeError, Err: err})
+		} else {
+			send(provider.Event{Type: provider.EventTypeDone, Usage: usage})
 		}
 	}()
 
@@ -186,6 +189,18 @@ func (p *Provider) buildRequest(messages []model.Message, tools []model.ToolDef)
 	}
 	if p.thinking != nil && p.thinking.BudgetTokens > 0 {
 		req.Thinking = sdk.ThinkingConfigParamOfEnabled(p.thinking.BudgetTokens)
+	}
+	if p.toolChoice != "" {
+		switch p.toolChoice {
+		case "auto":
+			req.ToolChoice = sdk.ToolChoiceUnionParam{OfAuto: &sdk.ToolChoiceAutoParam{}}
+		case "none":
+			req.ToolChoice = sdk.ToolChoiceUnionParam{OfNone: &sdk.ToolChoiceNoneParam{}}
+		case "any", "required":
+			req.ToolChoice = sdk.ToolChoiceUnionParam{OfAny: &sdk.ToolChoiceAnyParam{}}
+		default:
+			req.ToolChoice = sdk.ToolChoiceParamOfTool(p.toolChoice)
+		}
 	}
 
 	return req

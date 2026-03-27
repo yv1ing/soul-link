@@ -8,6 +8,7 @@ import (
 	"soul-link/internal/model"
 	"soul-link/internal/provider"
 	"soul-link/internal/provider/anthropic"
+	"soul-link/internal/provider/custom"
 	"soul-link/internal/provider/openai"
 	"soul-link/internal/registry"
 )
@@ -19,6 +20,9 @@ const (
 	anthropicKey   = ""
 	anthropicBase  = ""
 	anthropicModel = ""
+	customKey      = ""
+	customBase     = ""
+	customModel    = ""
 )
 
 // ── 辅助函数 ──────────────────────────────────────────────────────────────────
@@ -37,8 +41,13 @@ func eachProvider(t *testing.T, f func(t *testing.T, p provider.Provider)) {
 		},
 		{
 			name: "anthropic",
-			new:  func() provider.Provider { return anthropic.New(anthropicKey, anthropicBase, anthropicModel, 0, nil) },
+			new:  func() provider.Provider { return anthropic.New(anthropicKey, anthropicBase, anthropicModel, nil) },
 			skip: func() bool { return anthropicKey == "" },
+		},
+		{
+			name: "custom",
+			new:  func() provider.Provider { return custom.New(customKey, customBase, customModel, nil) },
+			skip: func() bool { return customKey == "" },
 		},
 		{
 			name: "openai/thinking",
@@ -50,9 +59,16 @@ func eachProvider(t *testing.T, f func(t *testing.T, p provider.Provider)) {
 		{
 			name: "anthropic/thinking",
 			new: func() provider.Provider {
-				return anthropic.New(anthropicKey, anthropicBase, anthropicModel, 16000, &model.ThinkingConfig{BudgetTokens: 5000})
+				return anthropic.New(anthropicKey, anthropicBase, anthropicModel, &model.ThinkingConfig{BudgetTokens: 5000}, anthropic.WithMaxTokens(16000))
 			},
 			skip: func() bool { return anthropicKey == "" },
+		},
+		{
+			name: "custom/thinking",
+			new: func() provider.Provider {
+				return custom.New(customKey, customBase, customModel, &model.ThinkingConfig{Effort: "high"})
+			},
+			skip: func() bool { return customKey == "" },
 		},
 	}
 
